@@ -12,7 +12,11 @@ from paxiva import PaxivaClient
 from services.scheduler import start_schedulers
 from logging_setup import setup_logging
 
+from middlewares.private_only import PrivateOnlyMiddleware
+
 from rich import initialize_premium_emojis
+
+from aiogram.types import ErrorEvent
 
 # ============================================================
 # ROUTERS
@@ -52,8 +56,20 @@ from handlers.admin import (
 
 from dev import panel as dev_panel
 
+# ✅ اضافه شد: روتر ترک گروه/کانال و روتر چک عضویت اجباری
+from handlers.group_guard import router as group_guard_router
+from handlers.force_sub import router as force_sub_router
+
 from middlewares.behavior_guard import BehaviorGuardMiddleware
-from dev.alerts import setup_alerts, alert_worker, send_alert
+# ✅ اضافه شد: میدل‌ویر عضویت اجباری
+from middlewares.force_sub import ForceSubMiddleware
+from dev.alerts import (
+    setup_alerts,
+    alert_worker,
+    send_alert,
+    install_log_handler,
+    describe_update,
+)
 
 
 # ============================================================
@@ -68,6 +84,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 _scheduler_task: Optional[asyncio.Task] = None
+_alert_worker_task: Optional[asyncio.Task] = None
 paxiva_client: Optional[PaxivaClient] = None
 
 
@@ -87,8 +104,62 @@ class CallbackDebugMiddleware(BaseMiddleware):
             logger.info("[CALLBACK COMPLETED] data=%r", event.data)
             return result
         except Exception:
-            logger.exception("[CALLBACK FAILED] data=%r", event.data)
+            logger.warning(
+                "[CALLBACK FAILED] data=%r user=%s",
+                event.data,
+                event.from_user.id if event.from_user else None,
+                exc_info=True,
+            )
             raise
+
+
+# ============================================================
+# GLOBAL ERROR HANDLER
+# ============================================================
+
+async def global_error_handler(event: ErrorEvent) -> bool:
+    """
+    ثبت خطاهای مدیریت‌نشده aiogram همراه با اطلاعات آپدیت و کاربر.
+    """
+
+    update = event.update
+
+    context = describe_update(update)
+
+    # استخراج نام کامل کاربر
+    for kind in (
+        "message",
+        "edited_message",
+        "callback_query",
+        "my_chat_member",
+        "inline_query",
+    ):
+        obj = getattr(update, kind, None)
+
+        if obj is None:
+            continue
+
+        user = getattr(obj, "from_user", None)
+
+        if user is not None:
+            context["full_name"] = user.full_name
+
+            if user.username:
+                context["username"] = f"@{user.username}"
+
+            break
+
+    user_id = context.pop("user_id", None)
+
+    send_alert(
+        "ERROR",
+        "خطای مدیریت‌نشده هنگام پردازش آپدیت تلگرام",
+        exc=event.exception,
+        user_id=user_id,
+        **context,
+    )
+
+    return True
 
 
 # ============================================================
@@ -254,11 +325,22 @@ def register_routers(dp: Dispatcher) -> None:
     ثبت تمام Routerهای ربات.
     ترتیب ثبت حفظ شده است.
     """
+    # --------------------------------------------------------
+    # PRIVATE ONLY (باید اولین چیزی باشد که روی dp ثبت می‌شود)
+    # هر پیام/دکمه/inline که از گروه یا کانال بیاید، قبل از رسیدن
+    # به هر هندلری (/start, /admin, /dev, ...) دور ریخته می‌شود.
+    # --------------------------------------------------------
+    dp.update.outer_middleware(PrivateOnlyMiddleware())
+
+    # --------------------------------------------------------
+    # GROUP GUARD / FORCE SUB CHECK ROUTER (باید قبل از همه باشد)
+    # --------------------------------------------------------
+    dp.include_router(group_guard_router)
+    dp.include_router(force_sub_router)
 
     # --------------------------------------------------------
     # USER ROUTERS
     # --------------------------------------------------------
-
     dp.include_router(start.router)
     dp.include_router(buy.router)
     dp.include_router(renew.router)
@@ -379,6 +461,8 @@ async def main() -> None:
 
     setup_logging(log_level=logging.INFO)
 
+    install_log_handler(level=logging.ERROR)
+
     logger.info("Initializing bot application...")
 
     print("[DEBUG 01] Logging initialized", flush=True)
@@ -416,14 +500,14 @@ async def main() -> None:
     # 3.1. SETUP DEV ALERTS
     # --------------------------------------------------------
 
+    global _alert_worker_task
+
     setup_alerts(bot)
-    asyncio.create_task(alert_worker())
 
-    # --------------------------------------------------------
-    # 3.2. TEST ALERT (موقت - برای تست)
-    # --------------------------------------------------------
-
-    send_alert("INFO", "تست هشدار - اگر این پیام را دیدی، سیستم هشدار کار می‌کند.")
+    _alert_worker_task = asyncio.create_task(
+        alert_worker(),
+        name="developer-alert-worker",
+    )
 
     try:
 
@@ -455,15 +539,32 @@ async def main() -> None:
 
         dp = Dispatcher()
 
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # 5.0. REGISTER GLOBAL ERROR HANDLER
+        # --------------------------------------------------------
+
+        dp.errors.register(global_error_handler)
+
+        # --------------------------------------------------------
         # 5.1. REGISTER BEHAVIOR GUARD (اولویت اول)
-        # ----------------------------------------------------
+        # --------------------------------------------------------
 
         dp.message.middleware(
             BehaviorGuardMiddleware()
         )
         dp.callback_query.middleware(
             BehaviorGuardMiddleware()
+        )
+
+        # ----------------------------------------------------
+        # 5.1.1. REGISTER FORCE-SUB MIDDLEWARE (بعد از امنیت، قبل از دیباگ)
+        # ----------------------------------------------------
+
+        dp.message.middleware(
+            ForceSubMiddleware()
+        )
+        dp.callback_query.middleware(
+            ForceSubMiddleware()
         )
 
         # ----------------------------------------------------
