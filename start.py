@@ -263,14 +263,29 @@ async def cmd_start_with_referral(
         return
 
     # استخراج کد رفرال
+    referral_payload = command.args or ""
+
     referrer_id = extract_referrer_id(
-        command.args,
+        referral_payload,
         user.id
+    )
+
+    logger.info(
+        "Start received: user=%s | payload=%r | referrer=%s",
+        user.id,
+        referral_payload,
+        referrer_id,
     )
 
     try:
         # ثبت یا به‌روزرسانی کاربر
         is_new = register_user(message)
+
+        logger.info(
+            "User registration completed: user=%s | is_new=%s",
+            user.id,
+            is_new,
+        )
 
         # فقط کاربر جدید می‌تواند معرف بگیرد
         if is_new and referrer_id:
@@ -285,7 +300,7 @@ async def cmd_start_with_referral(
 
                 if registered:
                     logger.info(
-                        "Referral registered: %s -> %s",
+                        "Referral registered successfully: %s -> %s",
                         referrer_id,
                         user.id,
                     )
@@ -296,11 +311,25 @@ async def cmd_start_with_referral(
                         user.id,
                         f"Direct referrer: {referrer_id}",
                     )
+                else:
+                    logger.warning(
+                        "Referral registration returned False: user=%s referrer=%s",
+                        user.id,
+                        referrer_id,
+                    )
             else:
                 logger.warning(
-                    "Referral ignored: referrer %s does not exist.",
+                    "Referral rejected: referrer %s does not exist. user=%s",
                     referrer_id,
+                    user.id,
                 )
+
+        elif referral_payload and not referrer_id:
+            logger.warning(
+                "Invalid referral payload: user=%s payload=%r",
+                user.id,
+                referral_payload,
+            )
 
         # ثبت فعالیت کاربر
         record_user_activity(user.id)
