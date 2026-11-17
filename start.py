@@ -1,10 +1,13 @@
 import logging
 import re
+import asyncio
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, CommandObject
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, MessageEntity
 from aiogram.exceptions import TelegramBadRequest
+
+from config import PINNED_MESSAGE_EMOJIS
 
 from database import (
     create_or_update_user,
@@ -13,6 +16,8 @@ from database import (
     is_banned,
     record_user_activity,
     log_event,
+    has_user_pinned_welcome,
+    mark_user_pinned_welcome,
 )
 
 from rich import rich_emoji, rich_bold, build_rich_message
@@ -24,6 +29,119 @@ import ui
 logger = logging.getLogger(__name__)
 router = Router(name="start")
 
+
+# ============================================================
+# Per-User Pinned Welcome Message
+# ============================================================
+
+_pinned_message_lock = asyncio.Lock()
+
+
+async def send_one_time_pinned_message(bot, chat_id: int):
+    """
+    ارسال و پین پیام ۹ ایموجی پریمیوم برای هر کاربر،
+    فقط یک بار در اولین ورود موفق.
+    """
+
+    async with _pinned_message_lock:
+
+        # بررسی وضعیت اختصاصی همین کاربر
+        if has_user_pinned_welcome(chat_id):
+            logger.debug(
+                "Pinned welcome already sent to user %s",
+                chat_id,
+            )
+            return
+
+        sent_message = None
+
+        try:
+            emoji_ids = [
+                str(emoji_id).strip()
+                for emoji_id in PINNED_MESSAGE_EMOJIS
+            ]
+
+            if len(emoji_ids) != 9 or not all(emoji_ids):
+                raise ValueError(
+                    "Exactly 9 custom emoji IDs are required."
+                )
+
+            # ساخت متن و موجودیت‌های ایموجی
+            text = "😀" * len(emoji_ids)
+
+            entities = [
+                MessageEntity(
+                    type="custom_emoji",
+                    offset=index * 2,
+                    length=2,
+                    custom_emoji_id=emoji_id,
+                )
+                for index, emoji_id in enumerate(emoji_ids)
+            ]
+
+            # ارسال پیام به کاربر
+            sent_message = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                entities=entities,
+                parse_mode=None,
+            )
+
+            # بررسی موجودیت‌های برگشتی
+            returned_entities = [
+                entity
+                for entity in (sent_message.entities or [])
+                if entity.type == "custom_emoji"
+            ]
+
+            if len(returned_entities) != 9:
+                raise RuntimeError(
+                    "Telegram did not return all 9 custom emoji entities. "
+                    f"Received: {len(returned_entities)}"
+                )
+
+            # پین پیام در چت خصوصی کاربر
+            await bot.pin_chat_message(
+                chat_id=chat_id,
+                message_id=sent_message.message_id,
+                disable_notification=True,
+            )
+
+            # ثبت موفقیت فقط پس از ارسال و پین
+            marked = mark_user_pinned_welcome(chat_id)
+
+            if not marked:
+                logger.warning(
+                    "Pinned welcome DB record was not inserted. user=%s",
+                    chat_id,
+                )
+
+            logger.info(
+                "Pinned welcome message sent successfully. "
+                "user=%s | emojis=%s",
+                chat_id,
+                len(returned_entities),
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to send pinned welcome message to user %s",
+                chat_id,
+            )
+
+            # اگر ارسال انجام شده ولی ادامه عملیات شکست خورده،
+            # پیام اشتباه یا ناقص را حذف می‌کنیم.
+            if sent_message is not None:
+                try:
+                    await bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=sent_message.message_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not delete failed welcome message. user=%s",
+                        chat_id,
+                    )
 
 # ============================================================
 # Referral Validation
@@ -187,6 +305,12 @@ async def cmd_start_with_referral(
         # ثبت فعالیت کاربر
         record_user_activity(user.id)
 
+        # ارسال و پین پیام اولیه (فقط یک بار برای هر کاربر)
+        await send_one_time_pinned_message(
+            message.bot,
+            user.id,
+        )
+
         # ارسال منوی اصلی Rich
         await send_main_menu(message)
 
@@ -237,6 +361,12 @@ async def cmd_start(message: Message):
 
         # ثبت فعالیت روزانه
         record_user_activity(user.id)
+
+        # ارسال و پین پیام اولیه (فقط یک بار برای هرکاربر)
+        await send_one_time_pinned_message(
+            message.bot,
+            user.id,
+        )
 
         # ارسال منوی اصلی Rich
         await send_main_menu(message)
