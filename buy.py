@@ -16,9 +16,9 @@ from config import (
     MAX_MONTHS, PREMIUM_EMOJIS, PREMIUM_EMOJI_ENABLED,
 )
 from database import (
-    add_balance, add_referral_commission, consume_discount_code, set_setting,
-    create_subscription, deduct_balance, get_balance, get_discount_code,
-    get_setting, hard_delete_subscription, increment_total_purchases, log_event,
+    add_balance, set_setting, finalize_purchase,
+    deduct_balance, get_balance, get_discount_code,
+    get_setting, hard_delete_subscription, log_event,
     list_products, get_product,
 )
 from paxiva import PaxivaClient, PaxivaError
@@ -355,6 +355,23 @@ def _discount_for_order(data: dict[str, Any]) -> tuple[int, Optional[int]]:
         return 0, None
 
 
+def _price_with_product_base(product: dict, key: str, volume: float, days: int, devices: int, currency: str) -> int:
+    """PRICE-01: قیمتِ ذخیره‌شده در محصول (که ادمین دستی تعیین کرده) مبنای قیمت است.
+    اضافه‌ها (ماه/دستگاه/بدون‌محدودیت) به‌صورت «اختلاف فرمول سفارش با فرمول پیکربندی پایهٔ محصول»
+    از روی تنظیمات قیمت اضافه می‌شود. اگر قیمت محصول صفر/نامعتبر بود، همان فرمول تنظیمات استفاده می‌شود."""
+    calc = order_price_toman if currency == "toman" else order_price_stars
+    formula = calc(key, volume, days, devices)
+    try:
+        stored = int(product.get("price_toman" if currency == "toman" else "price_stars") or 0)
+        base_days = int(product.get("days") or 0)
+    except (TypeError, ValueError):
+        return formula
+    if stored <= 0:
+        return formula
+    base_formula = calc(key, volume, base_days, MAX_DEVICES_DEFAULT)
+    return max(0, stored + (formula - base_formula))
+
+
 def _build_order_prices(data: dict[str, Any]) -> tuple[int, int, int, Optional[int]]:
     if not _valid_purchase_data(data):
         raise ValueError("Invalid purchase data")
@@ -368,8 +385,8 @@ def _build_order_prices(data: dict[str, Any]) -> tuple[int, int, int, Optional[i
     key = "unl_inf" if product["kind"] == "unl" and volume <= 0 else (
         "unl150" if product["kind"] == "unl" else f"vol_{int(volume)}"
     )
-    toman = order_price_toman(key, volume, days, devices)
-    stars = order_price_stars(key, volume, days, devices)
+    toman = _price_with_product_base(product, key, volume, days, devices, "toman")
+    stars = _price_with_product_base(product, key, volume, days, devices, "stars")
     if toman <= 0:
         raise ValueError("Price is not configured")
     discount_percent, discount_id = _discount_for_order(data)
@@ -506,9 +523,15 @@ async def _show_invoice(*, bot, state: FSMContext, source_message: Optional[Mess
 # ============================================================
 
 async def _delete_remote(paxiva: PaxivaClient, client_id: int) -> bool:
+    """PAX-02: حذف نرم (بدون purge) تا در صورت خطا قابل بازیابی از سطل بازیافت پنل باشد."""
     try:
-        await paxiva.delete_client(client_id, purge=True)
+        await paxiva.delete_client(client_id, purge=False)
         return True
+    except PaxivaError as exc:
+        if getattr(exc, "status_code", None) == 404:
+            return True  # قبلاً حذف شده
+        logger.exception("Could not delete remote client %s", client_id)
+        return False
     except Exception:
         logger.exception("Could not delete remote client %s", client_id)
         return False
@@ -550,6 +573,7 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
     debited = False
     create_started = False
     create_response_received = False
+    completed = False  # بعد از ثبت اتمیک اشتراک، هیچ rollbackی مجاز نیست
 
     try:
         debited = deduct_balance(user_id, price_toman, "purchase",
@@ -593,28 +617,20 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
         if not _valid_subscription_link(link):
             raise RuntimeError("PAXIVA returned invalid subscription link")
 
-        subscription_id = create_subscription(
-            telegram_id=user_id, config_number=number, config_name=config_name,
-            kind=kind, volume_gb=volume, days=days, devices=devices,
-            price_toman=price_toman, price_stars=0, paxiva_client_id=client_id, link=str(link),
-        )
-        if not subscription_id:
-            send_alert("ERROR", f"ذخیره اشتراک در دیتابیس ناموفق\nکاربر: {user_id}\nconfig: {config_name}\norder: {order_key}")
-            raise RuntimeError("Could not save subscription")
-
-        if discount_id is not None and not consume_discount_code(int(discount_id), user_id):
+        try:
+            subscription_id = finalize_purchase(
+                telegram_id=user_id, config_number=number, config_name=config_name,
+                kind=kind, volume_gb=volume, days=days, devices=devices,
+                price_toman=price_toman, paxiva_client_id=client_id, link=str(link),
+                discount_id=int(discount_id) if discount_id is not None else None,
+            )
+        except ValueError:
             send_alert("ERROR", f"مصرف کد تخفیف ناموفق\nکاربر: {user_id}\ndiscount_id: {discount_id}\norder: {order_key}")
             raise RuntimeError("Discount code became unavailable or was already used")
-
-        try:
-            increment_total_purchases(user_id)
         except Exception:
-            logger.exception("Could not increment purchase count")
-        try:
-            add_referral_commission(user_id, price_toman, int(subscription_id), "purchase")
-        except Exception:
-            logger.exception("Referral commission failed")
-            send_alert("WARNING", f"خطای پورسانت رفرال\nکاربر: {user_id}\nsub_id: {subscription_id}\norder: {order_key}")
+            send_alert("ERROR", f"ذخیره اشتراک در دیتابیس ناموفق\nکاربر: {user_id}\nconfig: {config_name}\norder: {order_key}")
+            raise
+        completed = True
 
         _safe_log("INFO", "purchase_success", user_id,
             f"order={order_key}; subscription={subscription_id}; client={client_id}; config={config_name}")
@@ -625,6 +641,12 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
 
     except Exception as exc:
         logger.exception("Purchase provisioning failed for user %s", user_id)
+        if completed and subscription_id:
+            # سرویس پرداخت و ثبت شده؛ خطای بعدی نباید آن را حذف کند
+            return "success", {
+                "config_name": config_name, "link": str(link), "client_id": client_id,
+                "subscription_id": int(subscription_id), "price_toman": price_toman,
+            }
         definitive_rejection = isinstance(exc, PaxivaError) and 400 <= int(getattr(exc, "status_code", 500)) < 500
         if create_started and not create_response_received and not definitive_rejection:
             _safe_log("CRITICAL", "purchase_ambiguous", user_id, f"order={order_key}; config={config_name}; no panel response")
