@@ -3,8 +3,8 @@ import html
 import logging
 import time
 from typing import Any, Optional
-
-from dev.alerts import send_alert
+from services.notifications import notify_manual_renew
+from dev.alerts import send_alert, user_context
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -719,7 +719,7 @@ async def normal_renew(
                 f"تمدید {config_name}",
             )
 
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Wallet deduction error: user=%s sub=%s",
                 user.id,
@@ -735,10 +735,12 @@ async def normal_renew(
 
             send_alert(
                 "ERROR",
-                f"خطای کسر کیف پول در تمدید\n"
-                f"کاربر: {user.id}\n"
-                f"سرویس: {sub_id}\n"
-                f"مبلغ: {price}"
+                "خطای کسر کیف پول در تمدید",
+                exc=exc,
+                user_id=user.id,
+                sub_id=sub_id,
+                price=price,
+                **user_context(user),
             )
 
             await callback.answer(
@@ -833,12 +835,17 @@ async def normal_renew(
             # 9. Update local subscription
             # ------------------------------------------------
 
-            update_subscription_state(
+            updated = update_subscription_state(
                 sub_id,
                 remote_state or "active",
                 remote_expiry,
                 remote_used,
             )
+
+            if not updated:
+                raise RuntimeError(
+                    f"Could not update subscription state after manual renewal: {sub_id}"
+                )
 
             # ------------------------------------------------
             # 10. Purchase statistics and referral
@@ -861,17 +868,19 @@ async def normal_renew(
                     "renewal",
                 )
 
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Referral commission failed: sub_id=%s",
                     sub_id,
                 )
                 send_alert(
                     "WARNING",
-                    f"خطای پورسانت رفرال در تمدید\n"
-                    f"کاربر: {user.id}\n"
-                    f"سرویس: {sub_id}\n"
-                    f"مبلغ: {price}"
+                    "خطای پورسانت رفرال در تمدید",
+                    exc=exc,
+                    user_id=user.id,
+                    sub_id=sub_id,
+                    price=price,
+                    **user_context(user),
                 )
 
             log_event(
@@ -935,13 +944,39 @@ async def normal_renew(
                 price,
             )
 
+            # ارسال اعلان تمدید دستی به کانال
+            try:
+                await notify_manual_renew(
+                    bot=callback.bot,
+                    user=user,
+                    config_name=config_name,
+                    days=days,
+                    price=price,
+                )
+            except Exception:
+                logger.exception(
+                    "Manual renewal channel notification failed: sub_id=%s",
+                    sub_id,
+                )
+
         # ----------------------------------------------------
         # 12. Definite PAXIVA logical rejection
         # ----------------------------------------------------
 
         except PaxivaError as exc:
             logger.error(f"PAXIVA renew error: {exc}")
-            send_alert("ERROR", f"خطای PAXIVA در تمدید عادی\nکاربر: {user.id}\nسرویس: {sub_id}\nخطا: {exc.message}")
+            send_alert(
+                "ERROR",
+                "خطای PAXIVA در تمدید عادی",
+                exc=exc,
+                user_id=user.id,
+                sub_id=sub_id,
+                price=price,
+                status_code=exc.status_code,
+                error_code=exc.error_code,
+                paxiva_message=exc.message,
+                **user_context(user),
+            )
 
             logger.error(
                 "PAXIVA renewal error: sub_id=%s phase=%s status=%s code=%s",
@@ -993,7 +1028,7 @@ async def normal_renew(
                         "تمدید توسط پنل پذیرفته نشد. مبلغ به کیف پول شما بازگشت داده شد."
                     )
 
-                except Exception:
+                except Exception as refund_exc:
                     logger.exception(
                         "CRITICAL: renewal refund failed: user=%s sub=%s",
                         user.id,
@@ -1008,11 +1043,14 @@ async def normal_renew(
                     )
 
                     send_alert(
-                        "ERROR",
-                        f"بازگشت وجه تمدید ناموفق\n"
-                        f"کاربر: {user.id}\n"
-                        f"سرویس: {sub_id}\n"
-                        f"مبلغ: {price}"
+                        "CRITICAL",
+                        "بازگشت وجه تمدید ناموفق (رد منطقی PAXIVA)",
+                        exc=refund_exc,
+                        user_id=user.id,
+                        sub_id=sub_id,
+                        price=price,
+                        config_name=config_name,
+                        **user_context(user),
                     )
 
                     await callback.message.answer(
@@ -1042,13 +1080,25 @@ async def normal_renew(
 
         except Exception as exc:
             logger.exception(f"Renew unexpected error: {exc}")
-            send_alert("ERROR", f"خطای غیرمنتظره در تمدید\nکاربر: {user.id}\nسرویس: {sub_id}")
 
             logger.exception(
                 "Unexpected renewal error: user=%s sub=%s phase=%s",
                 user.id,
                 sub_id,
                 phase,
+            )
+
+            send_alert(
+                "ERROR",
+                "خطای غیرمنتظره در تمدید",
+                exc=exc,
+                user_id=user.id,
+                sub_id=sub_id,
+                phase=phase,
+                price=price,
+                panel_renewed=panel_renewed,
+                traffic_reset=traffic_reset,
+                **user_context(user),
             )
 
             # اگر عملیات پنل شروع شده یا تمدید انجام شده،
@@ -1086,7 +1136,7 @@ async def normal_renew(
                         f"sub_id={sub_id}",
                     )
 
-                except Exception:
+                except Exception as refund_exc:
                     logger.exception(
                         "CRITICAL: pre-panel refund failed: sub_id=%s",
                         sub_id,
@@ -1100,11 +1150,14 @@ async def normal_renew(
                     )
 
                     send_alert(
-                        "ERROR",
-                        f"بازگشت وجه تمدید ناموفق (pre-panel)\n"
-                        f"کاربر: {user.id}\n"
-                        f"سرویس: {sub_id}\n"
-                        f"مبلغ: {price}"
+                        "CRITICAL",
+                        "بازگشت وجه تمدید ناموفق (pre-panel)",
+                        exc=refund_exc,
+                        user_id=user.id,
+                        sub_id=sub_id,
+                        price=price,
+                        config_name=config_name,
+                        **user_context(user),
                     )
 
 
@@ -1171,7 +1224,7 @@ async def enable_auto_renew(callback: CallbackQuery):
             f"sub_id={sub_id}",
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Could not enable auto renewal: sub_id=%s",
             sub_id,
@@ -1179,9 +1232,11 @@ async def enable_auto_renew(callback: CallbackQuery):
 
         send_alert(
             "ERROR",
-            f"خطا در فعال‌سازی تمدید خودکار\n"
-            f"کاربر: {user.id}\n"
-            f"سرویس: {sub_id}"
+            "خطا در فعال‌سازی تمدید خودکار",
+            exc=exc,
+            user_id=user.id,
+            sub_id=sub_id,
+            **user_context(user),
         )
 
         await callback.answer(
@@ -1254,7 +1309,7 @@ async def disable_auto_renew(callback: CallbackQuery):
             f"sub_id={sub_id}",
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Could not disable auto renewal: sub_id=%s",
             sub_id,
@@ -1262,9 +1317,11 @@ async def disable_auto_renew(callback: CallbackQuery):
 
         send_alert(
             "ERROR",
-            f"خطا در غیرفعال‌سازی تمدید خودکار\n"
-            f"کاربر: {user.id}\n"
-            f"سرویس: {sub_id}"
+            "خطا در غیرفعال‌سازی تمدید خودکار",
+            exc=exc,
+            user_id=user.id,
+            sub_id=sub_id,
+            **user_context(user),
         )
 
         await callback.answer(
