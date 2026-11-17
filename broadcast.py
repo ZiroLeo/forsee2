@@ -1,328 +1,335 @@
-import logging
 import asyncio
-from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+import time
+from typing import Optional
+
+from aiogram import Bot, F, Router
+from aiogram.exceptions import (
+    TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, Message
 
-from config import ADMIN_ID, PREMIUM_EMOJIS, PREMIUM_EMOJI_ENABLED
-from database import get_connection, get_user_by_identifier, is_banned, log_event
-from rich import premium_emoji, build_rich_message
+from database import get_all_user_ids, get_user_by_identifier, is_banned, log_event
+from .admin_ui import (
+    LINE, GREEN, RED, BLUE, ask, btn, cancel_kb, em, esc, menu, page,
+    protect, refresh_panel, remember_panel, reset_flow, title, toast,
+)
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_broadcast")
+protect(router)  # همهٔ هندلرها فقط برای ادمین اصلی
+
+# فاصله بین ارسال‌ها (ثانیه) و هر چند نفر یک‌بار گزارش پیشرفت ویرایش شود
+SEND_DELAY = 0.05
+PROGRESS_EVERY = 25
+
+# فقط یک ارسال همگانی هم‌زمان؛ نگه‌داشتن رفرنس تسک‌ها تا garbage collect نشوند
+_active: dict = {"running": False, "stop": False}
+_tasks: set[asyncio.Task] = set()
 
 
 class BroadcastStates(StatesGroup):
-    waiting_target = State()
-    waiting_text = State()
-    waiting_forward_link = State()
+    waiting_target = State()    # آیدی/یوزرنیم برای ارسال تکی
+    waiting_content = State()   # خود پیام (هر نوع: متن/عکس/ویدیو/فایل/ویس/...)
+    waiting_link = State()      # لینک پیام کانال
+    confirm = State()           # تأیید نهایی ارسال همگانی
 
 
 # ============================================================
-# HELPERS
+# منو
 # ============================================================
 
-def _emoji_id(key: str) -> str | None:
-    if not PREMIUM_EMOJI_ENABLED:
-        return None
-    return PREMIUM_EMOJIS.get(key)
+def _menu_markup():
+    return menu([
+        btn("ارسال به یک کاربر", "admin:broadcast:single", emoji="telegram"),
+        btn("ارسال به همه", "admin:broadcast:all", emoji="world"),
+        btn("ارسال از لینک کانال", "admin:broadcast:link", emoji="light"),
+    ], back="admin:main")
 
 
-def _button(
-    text: str,
-    callback_data: str,
-    style: str = "primary",
-    emoji_key: str | None = None,
-) -> InlineKeyboardButton:
-    kwargs = {"text": text, "callback_data": callback_data, "style": style}
-    eid = _emoji_id(emoji_key) if emoji_key else None
-    if eid:
-        kwargs["icon_custom_emoji_id"] = eid
-    return InlineKeyboardButton(**kwargs)
-
-
-async def _safe_answer(message: Message, text: str, markup=None):
-    try:
-        await message.answer(text, reply_markup=markup)
-    except Exception:
-        logger.exception("Could not send broadcast message.")
-
-
-# ============================================================
-# MENU
-# ============================================================
-
-@router.callback_query(F.data == "admin:broadcast:menu")
-async def broadcast_menu(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
-        return
-
-    text = (
-        f"{premium_emoji('ask', '📨')} "
-        "<b>ارسال پیام</b>\n\n"
-        "لطفاً یک گزینه را انتخاب کنید:"
+def _menu_text() -> str:
+    return (
+        f"{title('ask', '📨', 'ارسال پیام')}\n{LINE}\n\n"
+        "پیام می‌تواند <b>متن، عکس، ویدیو، فایل، ویس</b> و هر نوع دیگر باشد؛\n"
+        "قالب‌بندی و ایموجی‌های پریمیوم حفظ می‌شود.\n\n"
+        "نوع ارسال را انتخاب کن:"
     )
 
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            _button("ارسال به شخص", "admin:broadcast:single", "primary", "telegram"),
-            _button("ارسال به همه", "admin:broadcast:all", "primary", "world"),
-        ],
-        [
-            _button("بازگشت", "admin:main", "danger", "back"),
-        ],
-    ])
 
-    await _safe_answer(callback.message, text, markup)
-    await callback.answer()
+@router.callback_query(F.data == "admin:broadcast:menu")
+async def broadcast_menu(callback: CallbackQuery, state: FSMContext):
+    await reset_flow(state)
+    shown = await page(callback, _menu_text(), _menu_markup())
+    await remember_panel(state, shown)
+
+
+@router.callback_query(F.data == "admin:broadcast:cancel")
+async def broadcast_cancel(callback: CallbackQuery, state: FSMContext):
+    await reset_flow(state)
+    await toast(callback, "لغو شد.")
+    shown = await page(callback, _menu_text(), _menu_markup(), answer=False)
+    await remember_panel(state, shown)
 
 
 # ============================================================
-# SINGLE TARGET
+# شروع هر حالت
 # ============================================================
 
 @router.callback_query(F.data == "admin:broadcast:single")
-async def broadcast_single_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
-        return
-
-    await state.clear()
-    await state.set_state(BroadcastStates.waiting_target)
-    await state.update_data(broadcast_mode="single")
-
-    text = (
-        f"{premium_emoji('telegram', '👤')} "
-        "<b>آیدی عددی یا یوزرنیم کاربر را وارد کنید:</b>"
+async def start_single(callback: CallbackQuery, state: FSMContext):
+    await reset_flow(state)
+    await ask(
+        callback, state, BroadcastStates.waiting_target,
+        f"{title('telegram', '👤', 'ارسال به یک کاربر')}\n\n"
+        "آیدی عددی یا یوزرنیم کاربر را بفرست:",
+        "admin:broadcast:cancel", mode="single",
     )
 
-    await _safe_answer(callback.message, text)
-    await callback.answer()
 
+@router.callback_query(F.data == "admin:broadcast:all")
+async def start_all(callback: CallbackQuery, state: FSMContext):
+    if _active["running"]:
+        await toast(callback, "یک ارسال همگانی در حال انجام است.", True)
+        return
+    await reset_flow(state)
+    await ask(
+        callback, state, BroadcastStates.waiting_content,
+        f"{title('world', '📢', 'ارسال به همه')}\n\n"
+        "پیامی را که می‌خواهی برای همهٔ کاربران ارسال شود بفرست.\n"
+        "<i>(برای آلبوم چندعکسی فقط اولین پیام ارسال می‌شود.)</i>",
+        "admin:broadcast:cancel", mode="all",
+    )
+
+
+@router.callback_query(F.data == "admin:broadcast:link")
+async def start_link(callback: CallbackQuery, state: FSMContext):
+    if _active["running"]:
+        await toast(callback, "یک ارسال همگانی در حال انجام است.", True)
+        return
+    await reset_flow(state)
+    await ask(
+        callback, state, BroadcastStates.waiting_link,
+        f"{title('light', '🔗', 'ارسال از لینک کانال')}\n\n"
+        "لینک پیام کانال را بفرست:\n<code>https://t.me/channel/123</code>\n\n"
+        "ربات باید به آن کانال دسترسی داشته باشد.",
+        "admin:broadcast:cancel", mode="link",
+    )
+
+
+# ============================================================
+# دریافت ورودی‌ها
+# ============================================================
 
 @router.message(BroadcastStates.waiting_target)
-async def broadcast_single_target(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-
+async def got_target(message: Message, state: FSMContext, bot: Bot):
     raw = (message.text or "").strip()
     if not raw:
         await message.answer("❌ ورودی خالی است.")
         return
-
     target = get_user_by_identifier(raw)
     if not target:
-        await message.answer("❌ کاربر یافت نشد.")
+        await message.answer("❌ کاربر یافت نشد. دوباره بفرست.")
         return
-
-    await state.update_data(target_id=target["telegram_id"])
-    await state.set_state(BroadcastStates.waiting_text)
-
-    text = (
-        f"{premium_emoji('ask', '✍️')} "
-        "<b>متن پیام را وارد کنید:</b>"
+    await state.update_data(target_id=int(target["telegram_id"]))
+    await state.set_state(BroadcastStates.waiting_content)
+    await refresh_panel(
+        bot, state, message,
+        f"{title('ask', '✍️', 'پیام را بفرست')}\n\n"
+        f"گیرنده: <code>{int(target['telegram_id'])}</code>"
+        + (f" (@{esc(target['username'])})" if target.get("username") else ""),
+        cancel_kb("admin:broadcast:cancel"),
     )
 
-    await _safe_answer(message, text)
+
+def _parse_link(link: str) -> Optional[tuple]:
+    link = link.strip()
+    if not link.startswith("https://t.me/"):
+        return None
+    parts = [p for p in link.replace("https://t.me/", "").split("?")[0].split("/") if p]
+    try:
+        if parts[0] == "c":
+            return int(f"-100{int(parts[1])}"), int(parts[2])
+        return f"@{parts[0]}", int(parts[1])
+    except (IndexError, ValueError):
+        return None
 
 
-# ============================================================
-# SINGLE TEXT SEND
-# ============================================================
-
-@router.message(BroadcastStates.waiting_text)
-async def broadcast_text_handler(message: Message, state: FSMContext, bot):
-    if message.from_user.id != ADMIN_ID:
+@router.message(BroadcastStates.waiting_link)
+async def got_link(message: Message, state: FSMContext, bot: Bot):
+    parsed = _parse_link(message.text or "")
+    if not parsed:
+        await message.answer("❌ لینک نامعتبر است. نمونه: https://t.me/channel/123")
         return
+    chat_id, msg_id = parsed
+    # پیش‌نمایش: یک کپی برای خود ادمین؛ هم اعتبار لینک چک می‌شود هم محتوا دیده می‌شود
+    try:
+        await bot.copy_message(message.chat.id, chat_id, msg_id)
+    except Exception as exc:
+        await message.answer(f"❌ دسترسی به آن پیام ممکن نیست: {esc(exc)}")
+        return
+    await state.update_data(src_chat=chat_id, src_msg=msg_id)
+    await _show_confirm(bot, state, message)
 
+
+@router.message(BroadcastStates.waiting_content)
+async def got_content(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    mode = data.get("broadcast_mode")
-    body = (message.text or "").strip()
-
-    if not body:
-        await message.answer("❌ متن خالی است.")
-        return
-
-    if len(body) > 4000:
-        await message.answer("❌ متن بیش از حد طولانی است (حداکثر ۴۰۰۰ کاراکتر).")
-        return
+    mode = data.get("mode")
 
     if mode == "single":
         target_id = data.get("target_id")
         if not target_id:
-            await message.answer("❌ کاربر هدف مشخص نیست.")
-            await state.clear()
+            await message.answer("❌ گیرنده مشخص نیست.")
+            await reset_flow(state)
             return
-
         if is_banned(int(target_id)):
-            await message.answer("⛔ این کاربر بن شده است و پیام ارسال نشد.")
-            await state.clear()
+            await refresh_panel(bot, state, message,
+                f"{title('false', '⛔', 'این کاربر بن است؛ پیام ارسال نشد.')}",
+                menu([], back="admin:broadcast:menu"), delete_source=False)
+            await reset_flow(state)
             return
-
         try:
-            await bot.send_message(int(target_id), body)
-            await message.answer("✅ پیام ارسال شد.")
-            log_event("INFO", "broadcast_single", ADMIN_ID, f"target={target_id}")
-        except Exception as e:
-            logger.exception("Broadcast single failed.")
-            await message.answer(f"❌ خطا در ارسال: {e}")
-
-        await state.clear()
+            await bot.copy_message(int(target_id), message.chat.id, message.message_id)
+            log_event("INFO", "broadcast_single", message.from_user.id, f"target={target_id}")
+            text = title("true", "✅", "پیام ارسال شد.")
+        except TelegramForbiddenError:
+            text = title("false", "❌", "کاربر ربات را بلاک کرده است.")
+        except Exception as exc:
+            logger.exception("Broadcast single failed")
+            text = f"{title('false', '❌', 'خطا در ارسال')}\n<code>{esc(exc)}</code>"
+        await reset_flow(state)
+        await refresh_panel(bot, state, message, text,
+                            menu([], back="admin:broadcast:menu"), delete_source=False)
         return
 
-    if mode == "text":
-        await _send_to_all(bot, message, text=body)
-        await state.clear()
+    if mode == "all":
+        await state.update_data(src_chat=message.chat.id, src_msg=message.message_id)
+        await _show_confirm(bot, state, message)
         return
 
     await message.answer("❌ حالت ارسال نامشخص است.")
-    await state.clear()
+    await reset_flow(state)
 
 
 # ============================================================
-# ALL (MODE SELECT)
+# تأیید ارسال همگانی
 # ============================================================
 
-@router.callback_query(F.data == "admin:broadcast:all")
-async def broadcast_all_menu(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
-        return
-
-    text = (
-        f"{premium_emoji('ask', '📢')} "
-        "<b>ارسال به همه</b>\n\n"
-        "نوع ارسال را انتخاب کنید:"
+async def _show_confirm(bot: Bot, state: FSMContext, source: Message) -> None:
+    total = len(get_all_user_ids())
+    await state.set_state(BroadcastStates.confirm)
+    await refresh_panel(
+        bot, state, source,
+        f"{title('warning', '⚠️', 'تأیید ارسال همگانی')}\n{LINE}\n\n"
+        f"پیام بالا برای <b>{total}</b> کاربر (بدون بن‌شده‌ها) ارسال می‌شود.\n"
+        "این کار قابل بازگشت نیست. ادامه می‌دهی؟",
+        menu([btn("تأیید و ارسال", "admin:broadcast:go", style=GREEN, emoji="true")],
+             back="admin:broadcast:cancel", back_text="انصراف"),
+        delete_source=False,
     )
 
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            _button("ارسال متن عادی", "admin:broadcast:text", "primary", "light"),
-            _button("ارسال از طریق لینک", "admin:broadcast:link", "primary", "world"),
-        ],
-        [
-            _button("بازگشت", "admin:broadcast:menu", "danger", "back"),
-        ],
-    ])
 
-    await _safe_answer(callback.message, text, markup)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:broadcast:text")
-async def broadcast_text_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
+@router.callback_query(F.data == "admin:broadcast:go", BroadcastStates.confirm)
+async def confirm_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if _active["running"]:
+        await toast(callback, "یک ارسال همگانی در حال انجام است.", True)
+        return
+    data = await state.get_data()
+    src_chat, src_msg = data.get("src_chat"), data.get("src_msg")
+    if src_chat is None or src_msg is None:
+        await toast(callback, "پیام منبع پیدا نشد؛ از ابتدا شروع کن.", True)
+        await reset_flow(state)
         return
 
-    await state.clear()
-    await state.set_state(BroadcastStates.waiting_text)
-    await state.update_data(broadcast_mode="text")
+    admin_id = callback.from_user.id
+    panel = callback.message
+    await reset_flow(state)
+    await toast(callback, "ارسال شروع شد.")
 
-    text = (
-        f"{premium_emoji('ask', '✍️')} "
-        "<b>متن پیام را وارد کنید:</b>"
-    )
-
-    await _safe_answer(callback.message, text)
-    await callback.answer()
+    _active["running"], _active["stop"] = True, False
+    task = asyncio.create_task(_run_broadcast(bot, admin_id, panel, src_chat, src_msg))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
 
 
-@router.callback_query(F.data == "admin:broadcast:link")
-async def broadcast_link_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
-        return
-
-    await state.clear()
-    await state.set_state(BroadcastStates.waiting_forward_link)
-    await state.update_data(broadcast_mode="link")
-
-    text = (
-        f"{premium_emoji('world', '🔗')} "
-        "<b>لینک پیام کانال را وارد کنید:</b>\n\n"
-        "مثال: <code>https://t.me/channel/123</code>"
-    )
-
-    await _safe_answer(callback.message, text)
-    await callback.answer()
+@router.callback_query(F.data == "admin:broadcast:stop")
+async def stop_send(callback: CallbackQuery):
+    if _active["running"]:
+        _active["stop"] = True
+        await toast(callback, "در حال توقف...")
+    else:
+        await toast(callback, "ارسالی در حال انجام نیست.")
 
 
 # ============================================================
-# FORWARD LINK HANDLER
+# ارسال در پس‌زمینه
 # ============================================================
 
-@router.message(BroadcastStates.waiting_forward_link)
-async def broadcast_link_handler(message: Message, state: FSMContext, bot):
-    if message.from_user.id != ADMIN_ID:
-        return
+def _progress_text(done: int, total: int, ok: int, blocked: int, fail: int, finished: bool, stopped: bool) -> str:
+    percent = int(done * 100 / total) if total else 100
+    head = (title("true", "✅", "ارسال همگانی تمام شد") if finished and not stopped
+            else title("warning", "⏹", "ارسال متوقف شد") if stopped
+            else title("light", "📤", "در حال ارسال..."))
+    return (
+        f"{head}\n{LINE}\n\n"
+        f"پیشرفت: <b>{done}/{total}</b> ({percent}%)\n"
+        f"{em('true', '✅')} موفق: <b>{ok}</b>\n"
+        f"{em('false', '🚫')} بلاک‌کرده: <b>{blocked}</b>\n"
+        f"{em('warning', '❌')} ناموفق: <b>{fail}</b>"
+    )
 
-    link = (message.text or "").strip()
-    if not link.startswith("https://t.me/"):
-        await message.answer("❌ لینک نامعتبر است.")
-        return
 
+async def _edit(panel: Message, text: str, markup=None) -> None:
     try:
-        parts = link.replace("https://t.me/", "").split("/")
-        if parts[0] == "c":
-            chat_id = int(f"-100{parts[1]}")
-            msg_id = int(parts[2])
-        else:
-            chat_id = f"@{parts[0]}"
-            msg_id = int(parts[1])
-    except (IndexError, ValueError):
-        await message.answer("❌ فرمت لینک نامعتبر است.")
-        return
-
-    await _send_to_all(bot, message, forward_from=(chat_id, msg_id))
-    await state.clear()
+        await panel.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        pass
+    except Exception:
+        logger.debug("progress edit failed", exc_info=True)
 
 
-# ============================================================
-# SEND TO ALL USERS
-# ============================================================
-
-async def _send_to_all(bot, admin_message: Message, text=None, forward_from=None):
-    """ارسال به همه کاربران غیربن‌شده با تأخیر و گزارش موفق/ناموفق."""
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT telegram_id FROM users WHERE is_banned = 0"
-        ).fetchall()
-        user_ids = [int(r["telegram_id"]) for r in rows]
-
-    total = len(user_ids)
-    ok = 0
-    fail = 0
-
-    for uid in user_ids:
-        try:
-            if forward_from:
-                await bot.forward_message(
-                    chat_id=uid,
-                    from_chat_id=forward_from[0],
-                    message_id=forward_from[1],
-                )
+async def _run_broadcast(bot: Bot, admin_id: int, panel: Message, src_chat, src_msg) -> None:
+    ids = get_all_user_ids()
+    total = len(ids)
+    ok = blocked = fail = done = 0
+    stop_kb = menu([btn("توقف ارسال", "admin:broadcast:stop", style=RED, emoji="false")], back=None)
+    stopped = False
+    last_edit = 0.0
+    try:
+        await _edit(panel, _progress_text(0, total, 0, 0, 0, False, False), stop_kb)
+        for uid in ids:
+            if _active["stop"]:
+                stopped = True
+                break
+            for attempt in range(3):
+                try:
+                    await bot.copy_message(uid, src_chat, src_msg)
+                    ok += 1
+                    break
+                except TelegramRetryAfter as exc:
+                    await asyncio.sleep(float(exc.retry_after) + 1)
+                    continue  # همان کاربر دوباره
+                except TelegramForbiddenError:
+                    blocked += 1
+                    break
+                except Exception:
+                    fail += 1
+                    break
             else:
-                await bot.send_message(uid, text)
-            ok += 1
-        except Exception:
-            fail += 1
-        await asyncio.sleep(0.05)
-
-    log_event(
-        "INFO",
-        "broadcast_all",
-        ADMIN_ID,
-        f"ok={ok}, fail={fail}, total={total}",
-    )
-
-    report = (
-        f"{premium_emoji('true', '✅')} <b>ارسال به همه انجام شد.</b>\n\n"
-        f"{premium_emoji('telegram', '👥')} کل کاربران: <b>{total}</b>\n"
-        f"{premium_emoji('true', '✅')} موفق: <b>{ok}</b>\n"
-        f"{premium_emoji('false', '❌')} ناموفق: <b>{fail}</b>"
-    )
-
-    await _safe_answer(admin_message, report)
+                fail += 1  # سه بار flood-wait
+            done += 1
+            await asyncio.sleep(SEND_DELAY)
+            now = time.monotonic()
+            if done % PROGRESS_EVERY == 0 and now - last_edit > 2:
+                last_edit = now
+                await _edit(panel, _progress_text(done, total, ok, blocked, fail, False, False), stop_kb)
+    except Exception:
+        logger.exception("Broadcast crashed")
+    finally:
+        _active["running"], _active["stop"] = False, False
+        log_event("INFO", "broadcast_all", admin_id,
+                  f"ok={ok}, blocked={blocked}, fail={fail}, total={total}, stopped={stopped}")
+        await _edit(panel, _progress_text(done, total, ok, blocked, fail, True, stopped),
+                    menu([], back="admin:broadcast:menu"))
