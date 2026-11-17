@@ -3,7 +3,9 @@ import logging
 import re
 import html
 
-from dev.alerts import send_alert
+from services.notifications import notify_wallet_topup
+
+from dev.alerts import send_alert, user_context
 from aiogram import Router, F, Bot
 from aiogram.types import (
     CallbackQuery,
@@ -233,9 +235,15 @@ async def show_wallet(
             wallet_main_keyboard(),
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to display wallet.")
-        send_alert("ERROR", f"خطا در نمایش کیف پول\nکاربر: {user.id}")
+        send_alert(
+            "ERROR",
+            "خطا در نمایش کیف پول",
+            exc=exc,
+            user_id=user.id,
+            **user_context(user),
+        )
 
         if isinstance(callback.message, Message):
             await callback.message.answer(
@@ -297,9 +305,15 @@ async def show_wallet_history(
             wallet_history_keyboard(),
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to load wallet history.")
-        send_alert("ERROR", f"خطا در دریافت تاریخچه کیف پول\nکاربر: {user.id}")
+        send_alert(
+            "ERROR",
+            "خطا در دریافت تاریخچه کیف پول",
+            exc=exc,
+            user_id=user.id,
+            **user_context(user),
+        )
 
         if isinstance(callback.message, Message):
             await callback.message.answer(
@@ -435,9 +449,16 @@ async def receive_wallet_receipt(
             photo_file_id=photo.file_id,
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Could not create wallet payment request.")
-        send_alert("ERROR", f"خطا در ثبت درخواست شارژ\nکاربر: {user.id}\nمبلغ: {amount}")
+        send_alert(
+            "ERROR",
+            "خطا در ثبت درخواست شارژ",
+            exc=exc,
+            user_id=user.id,
+            amount=amount,
+            **user_context(user),
+        )
 
         await message.answer(
             "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> هنگام ثبت رسید مشکلی رخ داد.\n"
@@ -523,9 +544,15 @@ async def cancel_wallet_operation(
             wallet_main_keyboard(),
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to cancel wallet operation.")
-        send_alert("WARNING", f"خطا در لغو عملیات شارژ\nکاربر: {user.id}")
+        send_alert(
+            "WARNING",
+            "خطا در لغو عملیات شارژ",
+            exc=exc,
+            user_id=user.id,
+            **user_context(user),
+        )
 
 
 # ============================================================
@@ -579,13 +606,21 @@ async def notify_admin_receipt(
         )
         return
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Failed to send payment receipt to receipt admin %s. Request ID: %s",
             target,
             req_id,
         )
-        send_alert("ERROR", f"ارسال رسید به ادمین رسید ناموفق\nreq_id: {req_id}\nuser: {user_id}\nadmin: {target}")
+        send_alert(
+            "ERROR",
+            "ارسال رسید به ادمین رسید ناموفق",
+            exc=exc,
+            user_id=user_id,
+            req_id=req_id,
+            amount=amount,
+            receipt_admin_id=target,
+        )
 
     # اگر ادمین رسید در دسترس نبود (مثلاً ربات را استارت نکرده)، به ادمین اصلی می‌رود.
     if target != ADMIN_ID:
@@ -596,9 +631,16 @@ async def notify_admin_receipt(
                 caption=caption + "\n\n⚠️ ارسال برای ادمین رسید ناموفق بود.",
                 reply_markup=keyboard,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Fallback receipt delivery failed. Request ID: %s", req_id)
-            send_alert("ERROR", f"ارسال رسید به ادمین اصلی هم ناموفق بود\nreq_id: {req_id}\nuser: {user_id}")
+            send_alert(
+                "CRITICAL",
+                "ارسال رسید به ادمین اصلی هم ناموفق بود؛ هیچ ادمینی از این درخواست مطلع نشد",
+                exc=exc,
+                user_id=user_id,
+                req_id=req_id,
+                amount=amount,
+            )
 
 
 # ============================================================
@@ -658,7 +700,15 @@ async def admin_approve_payment(
             return
 
         if not approve_payment(req_id, callback.from_user.id):
-            send_alert("WARNING", f"تأیید پرداخت ناموفق (منطقی)\nreq_id: {req_id}\nadmin: {callback.from_user.id}")
+            send_alert(
+                "WARNING",
+                "تأیید پرداخت ناموفق (منطقی)",
+                user_id=callback.from_user.id,
+                req_id=req_id,
+                requester_id=req.get("telegram_id") if req else None,
+                amount=req.get("amount") if req else None,
+                **user_context(callback.from_user),
+            )
             await answer_callback(
                 callback,
                 "تأیید پرداخت انجام نشد.",
@@ -702,9 +752,26 @@ async def admin_approve_payment(
         except Exception:
             logger.exception("Could not log payment approval.")
 
-    except Exception:
+        # ارسال اعلان شارژ موفق کیف پول به کانال
+        try:
+            await notify_wallet_topup(
+                bot=bot,
+                user=req["telegram_id"],
+                amount=req["amount"],
+            )
+        except Exception:
+            logger.exception("Wallet top-up channel notification failed")
+
+    except Exception as exc:
         logger.exception("Payment approval failed.")
-        send_alert("ERROR", f"خطا در تأیید پرداخت\nreq_id: {req_id}\nadmin: {callback.from_user.id}")
+        send_alert(
+            "ERROR",
+            "خطا در تأیید پرداخت",
+            exc=exc,
+            user_id=callback.from_user.id,
+            req_id=req_id,
+            **user_context(callback.from_user),
+        )
 
         await answer_callback(
             callback,
@@ -764,7 +831,15 @@ async def admin_reject_payment(
             return
 
         if not reject_payment(req_id, callback.from_user.id):
-            send_alert("WARNING", f"رد پرداخت ناموفق (منطقی)\nreq_id: {req_id}\nadmin: {callback.from_user.id}")
+            send_alert(
+                "WARNING",
+                "رد پرداخت ناموفق (منطقی)",
+                user_id=callback.from_user.id,
+                req_id=req_id,
+                requester_id=req.get("telegram_id") if req else None,
+                amount=req.get("amount") if req else None,
+                **user_context(callback.from_user),
+            )
             await answer_callback(
                 callback,
                 "رد درخواست انجام نشد.",
@@ -808,9 +883,16 @@ async def admin_reject_payment(
         except Exception:
             logger.exception("Could not log payment rejection.")
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Payment rejection failed.")
-        send_alert("ERROR", f"خطا در رد پرداخت\nreq_id: {req_id}\nadmin: {callback.from_user.id}")
+        send_alert(
+            "ERROR",
+            "خطا در رد پرداخت",
+            exc=exc,
+            user_id=callback.from_user.id,
+            req_id=req_id,
+            **user_context(callback.from_user),
+        )
 
         await answer_callback(
             callback,
