@@ -399,6 +399,15 @@ def init_database() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_stars_chg_charge ON stars_charges(charge_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_date ON user_activity(activity_date);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wheel_telegram ON lucky_wheel_spins(telegram_id);")
+        # PAY-01: جلوگیری سطح دیتابیس از کسر/بازگشت/پورسانت تکراری برای یک سفارش
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_wallet_idempotent ON wallet_transactions(type, reference_id) "
+                "WHERE reference_id IS NOT NULL AND (type IN ('purchase', 'referral_commission') OR reference_id LIKE 'refund:%')"
+            )
+        except sqlite3.Error:
+            logger.warning("Could not create uq_wallet_idempotent (duplicate legacy rows?); "
+                           "application-level idempotency check stays active", exc_info=True)
 
     # دسترسی فایل دیتابیس فقط برای صاحب برنامه
     try:
@@ -596,14 +605,36 @@ def get_balance(telegram_id: int) -> int:
         row = conn.execute("SELECT balance FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
         return int(row["balance"]) if row else 0
 
+def _is_idempotent_tx(tx_type: str, reference_id: Optional[str]) -> bool:
+    """تراکنش‌هایی که برای یک reference_id فقط یک‌بار مجاز هستند (PAY-01).
+    خرید، پورسانت و بازگشت وجه با پیشوند refund: . سایر انواع (مثل تمدید) بدون محدودیت‌اند."""
+    if not reference_id:
+        return False
+    return tx_type in ("purchase", "referral_commission") or str(reference_id).startswith("refund:")
+
+
 def change_balance(telegram_id: int, delta: int, tx_type: str, description: str = "", reference_id: Optional[str] = None) -> bool:
+    """تغییر اتمیک موجودی.
+    اگر تراکنش idempotent باشد و قبلاً ثبت شده باشد: برای واریز (delta>0) True (قبلاً انجام شده،
+    دوباره اعمال نمی‌شود) و برای کسر False (جلوگیری از کسر/ساخت تکراری) برمی‌گردد."""
     telegram_id = validate_telegram_id(telegram_id)
     delta = int(delta)
     if delta == 0 or abs(delta) > 500_000_000:
         return False
+    if reference_id is not None:
+        reference_id = sanitize_text(str(reference_id), 200)
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if _is_idempotent_tx(tx_type, reference_id):
+                dup = conn.execute(
+                    "SELECT 1 FROM wallet_transactions WHERE type = ? AND reference_id = ? LIMIT 1",
+                    (tx_type, reference_id)
+                ).fetchone()
+                if dup:
+                    conn.rollback()
+                    logger.warning("Duplicate wallet tx ignored: type=%s ref=%s user=%s", tx_type, reference_id, telegram_id)
+                    return delta > 0
             row = conn.execute("SELECT balance FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
             if not row:
                 conn.rollback()
@@ -800,6 +831,55 @@ def create_subscription(
             conn.rollback()
             raise
 
+def finalize_purchase(
+    telegram_id: int, config_number: int, config_name: str, kind: str,
+    volume_gb: float, days: int, devices: int, price_toman: int,
+    paxiva_client_id: int, link: str, discount_id: Optional[int] = None,
+) -> int:
+    """FLOW-02: ثبت اشتراک + مصرف کد تخفیف + شمارش خرید + پورسانت رفرال در «یک» تراکنش.
+    یا همه انجام می‌شود یا هیچ‌کدام. در صورت ناموجود بودن کد تخفیف ValueError می‌دهد.
+    شناسهٔ اشتراک را برمی‌گرداند."""
+    telegram_id = validate_telegram_id(telegram_id)
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                """INSERT INTO subscriptions
+                (telegram_id, config_number, config_name, kind, volume_gb, days, devices,
+                 price_toman, price_stars, is_trial, paxiva_client_id, link, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'active', ?, ?)""",
+                (telegram_id, config_number, config_name, kind, volume_gb, days, devices,
+                 price_toman, paxiva_client_id, link, now_ts(), now_ts())
+            )
+            sub_id = int(cursor.lastrowid)
+            if discount_id is not None:
+                code = conn.execute("SELECT * FROM discount_codes WHERE id = ? AND is_active = 1", (int(discount_id),)).fetchone()
+                if not code or code["used_count"] >= code["max_uses"]:
+                    raise ValueError("discount_unavailable")
+                if conn.execute("SELECT 1 FROM discount_uses WHERE code_id = ? AND telegram_id = ?",
+                                (int(discount_id), telegram_id)).fetchone():
+                    raise ValueError("discount_unavailable")
+                conn.execute("INSERT INTO discount_uses (code_id, telegram_id, used_at) VALUES (?, ?, ?)",
+                             (int(discount_id), telegram_id, now_ts()))
+                new_count = code["used_count"] + 1
+                conn.execute("UPDATE discount_codes SET used_count = ?, is_active = ? WHERE id = ?",
+                             (new_count, 0 if new_count >= code["max_uses"] else 1, int(discount_id)))
+            conn.execute("UPDATE users SET total_purchases = total_purchases + 1 WHERE telegram_id = ?", (telegram_id,))
+            try:
+                # شکست پورسانت نباید خرید را خراب کند
+                conn.execute("SAVEPOINT ref")
+                _apply_referral_commission(conn, telegram_id, price_toman, sub_id, "purchase")
+                conn.execute("RELEASE ref")
+            except sqlite3.Error:
+                conn.execute("ROLLBACK TO ref")
+                conn.execute("RELEASE ref")
+                logger.exception("Referral commission failed inside finalize_purchase")
+            conn.commit()
+            return sub_id
+        except Exception:
+            conn.rollback()
+            raise
+
 def get_user_subscriptions(telegram_id: int, only_visible: bool = True) -> List[Dict[str, Any]]:
     telegram_id = validate_telegram_id(telegram_id)
     with get_connection() as conn:
@@ -874,33 +954,46 @@ def get_referrer(referred_id: int) -> Optional[int]:
         row = conn.execute("SELECT referrer_id FROM referrals WHERE referred_id = ?", (referred_id,)).fetchone()
         return int(row["referrer_id"]) if row else None
 
-def add_referral_commission(referred_id: int, purchase_amount: int, subscription_id: int, source: str = "purchase") -> bool:
-    referrer_id = get_referrer(referred_id)
-    if not referrer_id:
+def _apply_referral_commission(conn, referred_id: int, purchase_amount: int, subscription_id: int, source: str) -> bool:
+    """پورسانت رفرال داخل تراکنشِ باز (conn). یک پورسانت برای هر (subscription, source)."""
+    row = conn.execute("SELECT referrer_id FROM referrals WHERE referred_id = ?", (referred_id,)).fetchone()
+    if not row:
         return False
-    commission = int(purchase_amount * 0.05)
+    referrer_id = int(row["referrer_id"])
+    commission = int(purchase_amount) * 5 // 100
     if commission <= 0:
         return False
+    if conn.execute(
+        "SELECT 1 FROM referral_earnings WHERE subscription_id = ? AND source = ? AND referred_id = ? LIMIT 1",
+        (subscription_id, source, referred_id)
+    ).fetchone():
+        return False  # REF-01: پورسانت تکراری
+    bal = conn.execute("SELECT balance FROM users WHERE telegram_id = ?", (referrer_id,)).fetchone()
+    if not bal:
+        return False
+    before = int(bal["balance"])
+    after = before + commission
+    conn.execute(
+        "INSERT INTO referral_earnings (referrer_id, referred_id, amount, source, subscription_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (referrer_id, referred_id, commission, source, subscription_id, now_ts())
+    )
+    conn.execute("UPDATE users SET balance = ? WHERE telegram_id = ?", (after, referrer_id))
+    conn.execute(
+        "INSERT INTO wallet_transactions (telegram_id, amount, balance_before, balance_after, type, description, reference_id, created_at) "
+        "VALUES (?, ?, ?, ?, 'referral_commission', ?, ?, ?)",
+        (referrer_id, commission, before, after, f"پورسانت ۵٪ از خرید {referred_id}", f"{source}:{subscription_id}", now_ts())
+    )
+    return True
+
+def add_referral_commission(referred_id: int, purchase_amount: int, subscription_id: int, source: str = "purchase") -> bool:
+    referred_id = validate_telegram_id(referred_id)
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                "INSERT INTO referral_earnings (referrer_id, referred_id, amount, source, subscription_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (referrer_id, referred_id, commission, source, subscription_id, now_ts())
-            )
-            row = conn.execute("SELECT balance FROM users WHERE telegram_id = ?", (referrer_id,)).fetchone()
-            if row:
-                before = int(row["balance"])
-                after = before + commission
-                conn.execute("UPDATE users SET balance = ? WHERE telegram_id = ?", (after, referrer_id))
-                conn.execute(
-                    "INSERT INTO wallet_transactions (telegram_id, amount, balance_before, balance_after, type, description, reference_id, created_at) "
-                    "VALUES (?, ?, ?, ?, 'referral_commission', ?, ?, ?)",
-                    (referrer_id, commission, before, after, f"پورسانت ۵٪ از خرید {referred_id}", str(subscription_id), now_ts())
-                )
+            ok = _apply_referral_commission(conn, referred_id, purchase_amount, int(subscription_id), source)
             conn.commit()
-            return True
+            return ok
         except Exception:
             conn.rollback()
             raise
@@ -1153,65 +1246,8 @@ def record_wheel_spin(telegram_id: int, prize: str, prize_type: str, config_name
 
 # ------------------------- قیمت‌ها -------------------------
 
-PRICE_ITEMS = (
-    "per_gb", "per_gb_nolimit",
-    "per_device_vol", "per_device_unl",
-    "per_month_vol", "per_month_unl",
-    "unlimited_150", "unlimited_inf",
-)
-PRICE_CURRENCIES = ("toman", "stars")
-_PRICE_MAX = {"toman": 1_000_000_000, "stars": 1_000_000}
-
-
-def price_setting_key(item: str, currency: str) -> str:
-    """کلید ذخیره در جدول settings (با pricing.py یکسان است)."""
-    return f"price_{item}_{currency}"
-
-
-def get_price_override(item: str, currency: str) -> Optional[int]:
-    """قیمت ذخیره‌شده توسط ادمین، یا None اگر تنظیم نشده باشد."""
-    if item not in PRICE_ITEMS or currency not in PRICE_CURRENCIES:
-        return None
-    raw = get_setting(price_setting_key(item, currency))
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return None
-    return value if value >= 0 else None
-
-
-def set_price(item: str, currency: str, value: int, admin_id: Optional[int] = None) -> bool:
-    """ذخیره قیمت جدید + ثبت در تاریخچهٔ قیمت (در یک تراکنش)."""
-    if item not in PRICE_ITEMS or currency not in PRICE_CURRENCIES:
-        raise ValueError("Unknown price item/currency")
-    value = int(value)
-    if value < 0 or value > _PRICE_MAX[currency]:
-        raise ValueError("Price out of range")
-    key = price_setting_key(item, currency)
-    with get_connection() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-            try:
-                old = int(row["value"]) if row else None
-            except (TypeError, ValueError):
-                old = None
-            conn.execute(
-                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                (key, str(value), now_ts())
-            )
-            conn.execute(
-                "INSERT INTO price_history (item, currency, old_value, new_value, changed_by, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (item, currency, old, value, admin_id, now_ts())
-            )
-            conn.commit()
-            return True
-        except Exception:
-            conn.rollback()
-            raise
-
+# PRICE-02: توابع تکراری PRICE_ITEMS/set_price/get_price_override حذف شدند؛
+# کلیدهای قیمت فقط در pricing.py (PRICE_KEYS) و prices.py تعریف می‌شوند.
 
 def get_price_history(limit: int = 20, item: Optional[str] = None) -> List[Dict[str, Any]]:
     limit = max(1, min(int(limit), 200))
