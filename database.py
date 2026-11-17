@@ -335,6 +335,18 @@ def init_database() -> None:
             )
         """)
 
+        # ثبت دائمی ارسال پیام خوش‌آمدگویی پین‌شده برای هر کاربر.
+        # telegram_id کلید اصلی است؛ بنابراین برای هر کاربر فقط یک رکورد ممکن است.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_pinned_welcome (
+                telegram_id INTEGER PRIMARY KEY,
+                sent_at INTEGER NOT NULL,
+                FOREIGN KEY (telegram_id)
+                    REFERENCES users(telegram_id)
+                    ON DELETE CASCADE
+            )
+        """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS lucky_wheel_spins (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1600,3 +1612,48 @@ def check_integrity() -> bool:
     with get_connection() as conn:
         row = conn.execute("PRAGMA integrity_check").fetchone()
         return bool(row) and str(row[0]).lower() == "ok"
+
+# ============================================================
+# پیام خوش‌آمدگویی پین‌شده (یک‌بار برای هر کاربر)
+# ============================================================
+
+def has_user_pinned_welcome(telegram_id: int) -> bool:
+    """بررسی می‌کند آیا پیام خوش‌آمدگویی این کاربر قبلاً ثبت شده است."""
+    telegram_id = validate_telegram_id(telegram_id)
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM user_pinned_welcome WHERE telegram_id = ? LIMIT 1",
+            (telegram_id,),
+        ).fetchone()
+
+    return row is not None
+
+
+def mark_user_pinned_welcome(telegram_id: int) -> bool:
+    """
+    ثبت اتمیک ارسال موفق پیام خوش‌آمدگویی.
+
+    True: رکورد برای اولین بار ثبت شد.
+    False: قبلاً ثبت شده بود و رکورد تکراری ساخته نشد.
+    خطاهای دیتابیس عمداً به caller منتقل می‌شوند تا موفقیت جعلی ثبت نشود.
+    """
+    telegram_id = validate_telegram_id(telegram_id)
+
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO user_pinned_welcome
+                    (telegram_id, sent_at)
+                VALUES (?, ?)
+                """,
+                (telegram_id, now_ts()),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
