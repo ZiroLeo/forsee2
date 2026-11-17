@@ -5,6 +5,8 @@ import logging
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+from services.notifications import notify_purchase
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -32,7 +34,7 @@ from utils import (
 )
 
 # ✅ افزودن هشدار به دولوپر
-from dev.alerts import send_alert
+from dev.alerts import send_alert, user_context
 
 logger = logging.getLogger(__name__)
 router = Router(name="buy")
@@ -578,9 +580,10 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
     try:
         debited = deduct_balance(user_id, price_toman, "purchase",
             f"خرید سرویس {volume:g}GB / {days} روز", reference_id=order_key)
-    except Exception:
+    except Exception as exc:
         logger.exception("Wallet deduction failed")
-        send_alert("ERROR", f"خطای کسر کیف پول\nکاربر: {user_id}\nمبلغ: {price_toman}\norder: {order_key}")
+        send_alert("CRITICAL", "خطای کسر کیف پول (قبل از ساخت سرویس)", exc=exc, user_id=user_id,
+                   amount=price_toman, order=order_key, product_id=product_id, days=days, devices=devices)
         return "failed", "کسر موجودی انجام نشد. دوباره تلاش کن."
     if not debited:
         return "failed", "موجودی کیف پول کافی نیست یا کسر موجودی انجام نشد."
@@ -604,7 +607,10 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
             client_id = None
         if not client_id:
             _safe_log("CRITICAL", "purchase_missing_client_id", user_id, f"order={order_key}; config={config_name}")
-            return "pending", "پاسخ پنل شناسه سرویس نداشت. برای جلوگیری از ساخت تکراری، سفارش نیازمند بررسی پشتیبانی است."
+            send_alert("CRITICAL", "پاسخ پنل بدون شناسه سرویس؛ سرویس ممکن است ساخته شده باشد، پول کسر شده و بازگشت داده نشده",
+                       user_id=user_id, order=order_key, config=config_name, amount=price_toman,
+                       panel_response=str(client_data)[:500])
+            return "pending", ...
 
         link = client_data.get("link")
         if not _valid_subscription_link(link):
@@ -615,6 +621,9 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
             except Exception:
                 logger.exception("Could not get client subscription link")
         if not _valid_subscription_link(link):
+            send_alert("ERROR", "پنل لینک اشتراک نامعتبر برگرداند (rollback و بازگشت وجه انجام می‌شود)",
+                       user_id=user_id, order=order_key, client_id=client_id, config=config_name,
+                       link_preview=str(link)[:80])
             raise RuntimeError("PAXIVA returned invalid subscription link")
 
         try:
@@ -624,49 +633,77 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
                 price_toman=price_toman, paxiva_client_id=client_id, link=str(link),
                 discount_id=int(discount_id) if discount_id is not None else None,
             )
-        except ValueError:
-            send_alert("ERROR", f"مصرف کد تخفیف ناموفق\nکاربر: {user_id}\ndiscount_id: {discount_id}\norder: {order_key}")
+        except ValueError as exc:
+            send_alert("WARNING", "کد تخفیف هم‌زمان مصرف شد؛ سفارش rollback و پول برگردانده می‌شود",
+                       exc=exc, user_id=user_id, discount_id=discount_id, order=order_key,
+                       client_id=client_id, config=config_name)
             raise RuntimeError("Discount code became unavailable or was already used")
-        except Exception:
-            send_alert("ERROR", f"ذخیره اشتراک در دیتابیس ناموفق\nکاربر: {user_id}\nconfig: {config_name}\norder: {order_key}")
+        except Exception as exc:
+            send_alert("CRITICAL", "ثبت اشتراک در دیتابیس ناموفق (سرویس در پنل ساخته شده)", exc=exc,
+                       user_id=user_id, order=order_key, client_id=client_id, config=config_name,
+                       amount=price_toman, product_id=product_id)
             raise
         completed = True
 
         _safe_log("INFO", "purchase_success", user_id,
             f"order={order_key}; subscription={subscription_id}; client={client_id}; config={config_name}")
         return "success", {
-            "config_name": config_name, "link": str(link), "client_id": client_id,
-            "subscription_id": int(subscription_id), "price_toman": price_toman,
+            "config_name": config_name,
+            "link": str(link),
+            "client_id": client_id,
+            "subscription_id": int(subscription_id),
+            "price_toman": price_toman,
+            "kind": kind,
+            "volume_gb": volume,
+            "days": days,
+            "devices": devices,
         }
 
     except Exception as exc:
         logger.exception("Purchase provisioning failed for user %s", user_id)
         if completed and subscription_id:
             # سرویس پرداخت و ثبت شده؛ خطای بعدی نباید آن را حذف کند
+            send_alert("WARNING", "خطا بعد از ثبت موفق خرید؛ سرویس حفظ شد", exc=exc, user_id=user_id,
+                       order=order_key, subscription_id=subscription_id, client_id=client_id)
             return "success", {
-                "config_name": config_name, "link": str(link), "client_id": client_id,
-                "subscription_id": int(subscription_id), "price_toman": price_toman,
+                "config_name": config_name,
+                "link": str(link),
+                "client_id": client_id,
+                "subscription_id": int(subscription_id),
+                "price_toman": price_toman,
+                "kind": kind,
+                "volume_gb": volume,
+                "days": days,
+                "devices": devices,
             }
         definitive_rejection = isinstance(exc, PaxivaError) and 400 <= int(getattr(exc, "status_code", 500)) < 500
         if create_started and not create_response_received and not definitive_rejection:
             _safe_log("CRITICAL", "purchase_ambiguous", user_id, f"order={order_key}; config={config_name}; no panel response")
             # ✅ هشدار به دولوپر
-            send_alert("ERROR", f"خرید مبهم - پنل پاسخ نداد\nکاربر: {user_id}\norder: {order_key}\nconfig: {config_name}")
+            send_alert("CRITICAL", "خرید مبهم: پنل پاسخ نداد؛ پول کسر شده و سرویس شاید ساخته شده. بررسی دستی لازم است",
+                       exc=exc, user_id=user_id, order=order_key, config=config_name, amount=price_toman,
+                       product_id=product_id, days=days, devices=devices)
             return "pending", ("ارتباط با پنل هنگام ساخت سرویس قطع شد و نتیجه قطعی نیست. ممکن است سرویس ساخته شده باشد؛ "
                                 "برای جلوگیری از خرید تکراری، بازپرداخت خودکار انجام نمی‌شود. با پشتیبانی تماس بگیر.")
 
         if client_id is not None and not await _delete_remote(paxiva, client_id):
             _safe_log("CRITICAL", "purchase_orphan_client", user_id, f"order={order_key}; client={client_id}")
             # ✅ هشدار به دولوپر
-            send_alert("ERROR", f"حذف سرویس از پنل ناموفق\nکاربر: {user_id}\nclient: {client_id}\norder: {order_key}")
+            send_alert("CRITICAL", "سرویس یتیم در پنل: rollback انجام نشد و پول برنگشت",
+                       exc=exc, user_id=user_id, order=order_key, client_id=client_id,
+                       config=config_name, amount=price_toman)
             return "pending", "سرویس در پنل ساخته شده اما حذف آن تأیید نشد؛ سفارش نیازمند بررسی پشتیبانی است."
 
         if subscription_id is not None:
             try:
                 if not hard_delete_subscription(int(subscription_id)):
+                    send_alert("ERROR", "حذف اشتراک محلی هنگام rollback تأیید نشد", user_id=user_id,
+                               order=order_key, subscription_id=subscription_id, client_id=client_id)
                     return "pending", "سرویس حذف شد اما پاک‌سازی دیتابیس تأیید نشد. با پشتیبانی تماس بگیر."
-            except Exception:
+            except Exception as rb_exc:
                 logger.exception("Local subscription rollback failed")
+                send_alert("ERROR", "rollback اشتراک محلی با خطا مواجه شد", exc=rb_exc, user_id=user_id,
+                           order=order_key, subscription_id=subscription_id, client_id=client_id)
                 return "pending", "پاک‌سازی سفارش کامل نشد و نیازمند بررسی پشتیبانی است."
 
         if number is not None:
@@ -675,13 +712,17 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
         if debited and not _refund(user_id, price_toman, order_key, f"بازگشت وجه سفارش {config_name or order_key}"):
             _safe_log("CRITICAL", "purchase_refund_failed", user_id, f"order={order_key}; amount={price_toman}")
             # ✅ هشدار به دولوپر
-            send_alert("ERROR", f"بازگشت وجه ناموفق\nکاربر: {user_id}\nمبلغ: {price_toman}\norder: {order_key}")
+            send_alert("CRITICAL", "بازگشت وجه ناموفق: کاربر پول داده و سرویس نگرفته",
+                       exc=exc, user_id=user_id, order=order_key, amount=price_toman,
+                       refund_reference=f"refund:{order_key}", config=config_name)
             return "pending", "خرید ناموفق بود اما بازگشت وجه تأیید نشد. فوراً با پشتیبانی تماس بگیر."
 
         _safe_log("ERROR", "purchase_failed", user_id, f"order={order_key}; error={type(exc).__name__}")
         if isinstance(exc, PaxivaError):
             # ✅ هشدار به دولوپر
-            send_alert("ERROR", f"خطای PAXIVA در خرید\nکاربر: {user_id}\nخطا: {exc.message}\norder: {order_key}")
+            send_alert("ERROR", f"پنل ساخت سرویس را رد کرد: {exc.message}", exc=exc, user_id=user_id,
+                       order=order_key, status_code=getattr(exc, "status_code", None),
+                       product_id=product_id, volume_gb=volume, days=days, devices=devices, refunded="yes")
             return "failed", "پنل ساخت سرویس را رد کرد؛ مبلغ به کیف پولت بازگشت داده شد."
         return "failed", "ساخت سرویس کامل نشد؛ مبلغ به کیف پولت بازگشت داده شد."
 
@@ -1000,9 +1041,10 @@ async def pay_with_wallet(callback: CallbackQuery, state: FSMContext, paxiva: Pa
         try:
             price_toman, _stars, _discount, _discount_id = _build_order_prices(data)
             balance = get_balance(user.id)
-        except Exception:
+        except Exception as exc:
             logger.exception("Could not validate payment")
-            send_alert("ERROR", f"خطای اعتبارسنجی پرداخت\nکاربر: {user.id}")
+            send_alert("ERROR", "خطای اعتبارسنجی پرداخت قبل از کسر", exc=exc, user_id=user.id,
+                       product_id=data.get("product_id"), order=data.get("idempotency_key"))
             await _edit_callback(callback, state, "بررسی مبلغ یا موجودی ناموفق بود. دوباره فاکتور بگیر.")
             return
         if balance < price_toman:
@@ -1019,9 +1061,10 @@ async def pay_with_wallet(callback: CallbackQuery, state: FSMContext, paxiva: Pa
         order_key = str(data.get("idempotency_key") or "")
         try:
             _persist_pending_purchase(user.id, order_key, "processing")
-        except Exception:
+        except Exception as exc:
             logger.exception("Could not persist purchase lock before payment")
-            send_alert("ERROR", f"ذخیره قفل خرید ناموفق\nکاربر: {user.id}\norder: {order_key}")
+            send_alert("ERROR", "ذخیرهٔ قفل خرید در دیتابیس ناموفق (دیتابیس قفل/خراب؟)", exc=exc,
+                       user_id=user.id, order=order_key)
             await _edit_callback(callback, state,
                 "ثبت امن سفارش در دیتابیس ناموفق بود؛ برای جلوگیری از کسر وجه، پرداخت انجام نشد.")
             await state.update_data(purchase_processing=False)
@@ -1042,13 +1085,35 @@ async def pay_with_wallet(callback: CallbackQuery, state: FSMContext, paxiva: Pa
                 f"{premium_emoji('safe', '●')} لینک اشتراک محرمانه است؛ آن را در اختیار دیگران قرار نده."
             )
             try:
-                await callback.message.edit_text(success_text,
-                    reply_markup=purchase_success_keyboard(int(result.get("client_id", 0))))
+                await callback.message.edit_text(
+                    success_text,
+                    reply_markup=purchase_success_keyboard(int(result.get("client_id", 0)))
+                )
             except TelegramBadRequest as exc:
                 if "message is not modified" not in str(exc).lower():
                     logger.exception("Could not display purchase success")
+
+            # ارسال اعلان خرید موفق به کانال
+            try:
+                await notify_purchase(
+                    bot=callback.bot,
+                    user=user,
+                    config_name=result.get("config_name"),
+                    kind=result.get("kind"),
+                    volume_gb=result.get("volume_gb", 0),
+                    days=result.get("days", 0),
+                    devices=result.get("devices", 0),
+                    amount=result.get("price_toman", 0),
+                )
+            except Exception as exc:
+                logger.exception("Purchase channel notification failed")
+                send_alert("WARNING", "ارسال اعلان خرید به کانال ناموفق (خرید موفق بود)", exc=exc,
+                           user_id=user.id, config=result.get("config_name"))
+
             return
         if status == "pending":
+            send_alert("ERROR", f"سفارش در وضعیت «نیازمند بررسی»؛ خریدهای جدید این کاربر مسدود شد: {result}",
+                       user_id=user.id, order=order_key, product_id=data.get("product_id"))
             _pending_purchase_users.add(user.id)
             try:
                 _persist_pending_purchase(user.id, order_key, "pending_review")
@@ -1107,9 +1172,10 @@ async def send_all_subscription_configs(callback: CallbackQuery, paxiva: PaxivaC
                 f"{premium_emoji('true', '●')} <b>{sent} کانفیگ با موفقیت ارسال شد.</b>\nهر کانفیگ را جداگانه کپی کن.")
         else:
             await callback.message.answer("هیچ لینک کانفیگ معتبری در پاسخ پنل نبود.")
-    except Exception:
+    except Exception as exc:
         logger.exception("Could not retrieve PAXIVA configs for client %s", client_id)
-        send_alert("ERROR", f"دریافت کانفیگ‌ها از پنل ناموفق\nکاربر: {callback.from_user.id}\nclient_id: {client_id}")
+        send_alert("ERROR", "دریافت کانفیگ‌ها از پنل ناموفق", exc=exc, user_id=callback.from_user.id,username=callback.from_user.username,
+                   client_id=client_id)
         await callback.message.answer(
             f"{premium_emoji('warning', '●')} دریافت کانفیگ‌ها از پنل ناموفق بود. کمی بعد دوباره تلاش کن.")
 
