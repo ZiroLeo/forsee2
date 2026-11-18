@@ -386,6 +386,9 @@ def init_database() -> None:
         _ensure_column(conn, "bans", "unbanned_by", "INTEGER")
         _ensure_column(conn, "bans", "unbanned_at", "INTEGER")
         _ensure_column(conn, "payment_requests", "review_note", "TEXT")
+        # کد تخفیف اختصاصی (مثلاً جایزهٔ گردونه): فقط برای owner_id و تا expires_at معتبر است
+        _ensure_column(conn, "discount_codes", "owner_id", "INTEGER")
+        _ensure_column(conn, "discount_codes", "expires_at", "INTEGER")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hist ON price_history(item, currency, id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON admin_audit(created_at);")
@@ -622,7 +625,7 @@ def _is_idempotent_tx(tx_type: str, reference_id: Optional[str]) -> bool:
     خرید، پورسانت و بازگشت وجه با پیشوند refund: . سایر انواع (مثل تمدید) بدون محدودیت‌اند."""
     if not reference_id:
         return False
-    return tx_type in ("purchase", "referral_commission") or str(reference_id).startswith("refund:")
+    return tx_type in ("purchase", "referral_commission", "wheel_prize") or str(reference_id).startswith("refund:")
 
 
 def change_balance(telegram_id: int, delta: int, tx_type: str, description: str = "", reference_id: Optional[str] = None) -> bool:
@@ -866,7 +869,7 @@ def finalize_purchase(
             sub_id = int(cursor.lastrowid)
             if discount_id is not None:
                 code = conn.execute("SELECT * FROM discount_codes WHERE id = ? AND is_active = 1", (int(discount_id),)).fetchone()
-                if not code or code["used_count"] >= code["max_uses"]:
+                if not code or code["used_count"] >= code["max_uses"] or not discount_usable_by(code, telegram_id):
                     raise ValueError("discount_unavailable")
                 if conn.execute("SELECT 1 FROM discount_uses WHERE code_id = ? AND telegram_id = ?",
                                 (int(discount_id), telegram_id)).fetchone():
@@ -1033,7 +1036,8 @@ def get_referral_details(referrer_id: int, limit: int = 100) -> List[Dict[str, A
 # کد تخفیف
 # ============================================================
 
-def create_discount_code(code: str, percent: int, max_uses: int) -> Optional[int]:
+def create_discount_code(code: str, percent: int, max_uses: int,
+                         owner_id: Optional[int] = None, expires_days: Optional[int] = None) -> Optional[int]:
     code = sanitize_text(code, 50)
     try:
         percent, max_uses = int(percent), int(max_uses)
@@ -1043,9 +1047,11 @@ def create_discount_code(code: str, percent: int, max_uses: int) -> Optional[int
         return None
     with get_connection() as conn:
         try:
+            expires_at = now_ts() + int(expires_days) * 86400 if expires_days else None
             cursor = conn.execute(
-                "INSERT INTO discount_codes (code, percent, max_uses, used_count, is_active, created_at) VALUES (?, ?, ?, 0, 1, ?)",
-                (code, percent, max_uses, now_ts())
+                "INSERT INTO discount_codes (code, percent, max_uses, used_count, is_active, created_at, owner_id, expires_at) "
+                "VALUES (?, ?, ?, 0, 1, ?, ?, ?)",
+                (code, percent, max_uses, now_ts(), int(owner_id) if owner_id else None, expires_at)
             )
             conn.commit()
             return cursor.lastrowid
@@ -1059,13 +1065,26 @@ def get_discount_code(code: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("SELECT * FROM discount_codes WHERE code = ? COLLATE NOCASE", (code,)).fetchone()
         return dict(row) if row else None
 
+def discount_usable_by(code: Any, telegram_id: int) -> bool:
+    """آیا این کد برای این کاربر قابل استفاده است؟ (مالک اختصاصی + تاریخ انقضا)"""
+    try:
+        owner = code["owner_id"]
+        expires = code["expires_at"]
+    except (KeyError, IndexError, TypeError):
+        return True  # دیتابیس قدیمی بدون این ستون‌ها
+    if owner and int(owner) != int(telegram_id):
+        return False
+    if expires and now_ts() > int(expires):
+        return False
+    return True
+
 def consume_discount_code(code_id: int, telegram_id: int) -> bool:
     telegram_id = validate_telegram_id(telegram_id)
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
             code = conn.execute("SELECT * FROM discount_codes WHERE id = ? AND is_active = 1", (code_id,)).fetchone()
-            if not code or code["used_count"] >= code["max_uses"]:
+            if not code or code["used_count"] >= code["max_uses"] or not discount_usable_by(code, telegram_id):
                 conn.rollback()
                 return False
             used = conn.execute("SELECT 1 FROM discount_uses WHERE code_id = ? AND telegram_id = ?", (code_id, telegram_id)).fetchone()
@@ -1160,6 +1179,73 @@ def list_products(active_only: bool = True) -> List[Dict[str, Any]]:
         query += " ORDER BY id DESC"
         rows = conn.execute(query).fetchall()
         return [dict(r) for r in rows]
+
+# ------------------------- گردونه: چرخش اتمیک با شرط رفرال روزانه -------------------------
+
+def tehran_day_start_ts() -> int:
+    """زمان شروع «امروز» (۰۰:۰۰) به وقت تهران، به‌صورت timestamp."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Asia/Tehran")
+    except Exception:
+        tz = timezone(timedelta(hours=3, minutes=30))
+    now = datetime.now(tz)
+    return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+def count_referrals_since(referrer_id: int, since_ts: int) -> int:
+    """تعداد دعوت‌های ثبت‌شده از since_ts به بعد (از جدول referrals)."""
+    referrer_id = validate_telegram_id(referrer_id)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM referrals WHERE referrer_id = ? AND created_at >= ?",
+            (referrer_id, int(since_ts))
+        ).fetchone()
+        return int(row["c"])
+
+def try_record_spin(telegram_id: int, prize: str, prize_type: str,
+                    cooldown_hours: int = 24, min_referrals_today: int = 1) -> Tuple[Optional[int], str]:
+    """
+    در «یک» تراکنش: محدودیت زمانی + شرط رفرال امروز را چک می‌کند و چرخش را ثبت می‌کند.
+    (spin_id, "ok") یا (None, "cooldown" | "no_referral_today").
+    دو کلیک هم‌زمان نمی‌توانند دو چرخش بگیرند.
+    """
+    telegram_id = validate_telegram_id(telegram_id)
+    prize = sanitize_text(prize, 100) or "?"
+    prize_type = sanitize_text(prize_type, 20) or "nothing"
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            last = conn.execute(
+                "SELECT created_at FROM lucky_wheel_spins WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
+                (telegram_id,)
+            ).fetchone()
+            if last and now_ts() - int(last["created_at"]) < int(cooldown_hours) * 3600:
+                conn.rollback()
+                return None, "cooldown"
+            if min_referrals_today > 0:
+                cnt = conn.execute(
+                    "SELECT COUNT(*) AS c FROM referrals WHERE referrer_id = ? AND created_at >= ?",
+                    (telegram_id, tehran_day_start_ts())
+                ).fetchone()["c"]
+                if int(cnt) < int(min_referrals_today):
+                    conn.rollback()
+                    return None, "no_referral_today"
+            cursor = conn.execute(
+                "INSERT INTO lucky_wheel_spins (telegram_id, prize, prize_type, config_name, created_at) VALUES (?, ?, ?, NULL, ?)",
+                (telegram_id, prize, prize_type, now_ts())
+            )
+            conn.commit()
+            return int(cursor.lastrowid), "ok"
+        except Exception:
+            conn.rollback()
+            raise
+
+def void_wheel_spin(spin_id: int) -> bool:
+    """وقتی جایزه تحویل داده نشد، چرخش را برمی‌گرداند تا کاربر دوباره بتواند بچرخاند."""
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM lucky_wheel_spins WHERE id = ?", (int(spin_id),))
+        return cursor.rowcount > 0
 
 # ============================================================
 # گزارش و DAU
@@ -1656,4 +1742,3 @@ def mark_user_pinned_welcome(telegram_id: int) -> bool:
         except Exception:
             conn.rollback()
             raise
-
