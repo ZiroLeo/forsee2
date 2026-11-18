@@ -21,7 +21,7 @@ from database import (
     add_balance, set_setting, finalize_purchase,
     deduct_balance, get_balance, get_discount_code,
     get_setting, hard_delete_subscription, log_event,
-    list_products, get_product,
+    list_products, get_product, discount_usable_by,
 )
 from paxiva import PaxivaClient, PaxivaError
 from services.counter import make_config_name, release_reserved_number, reserve_new_config_number
@@ -350,6 +350,8 @@ def _discount_for_order(data: dict[str, Any]) -> tuple[int, Optional[int]]:
             return 0, None
         if not code.get("is_active") or int(code.get("used_count", 0)) >= int(code.get("max_uses", 0)):
             return 0, None
+        if not discount_usable_by(code, int(data.get("user_id", 0))):
+            return 0, None  # کد اختصاصی دیگران یا منقضی‌شده
         percent = int(code.get("percent", 0))
         return (percent, int(data["discount_id"])) if 1 <= percent <= 100 else (0, None)
     except Exception:
@@ -983,7 +985,8 @@ async def process_discount_code(message: Message, state: FSMContext):
         logger.exception("Discount lookup failed")
         await _edit_user_message(message, state, "بررسی کد تخفیف ناموفق بود. دوباره تلاش کن.")
         return
-    if not code or not code.get("is_active") or int(code.get("used_count", 0)) >= int(code.get("max_uses", 0)):
+    if (not code or not code.get("is_active") or int(code.get("used_count", 0)) >= int(code.get("max_uses", 0))
+            or not discount_usable_by(code, user.id)):
         await _edit_user_message(message, state,
             f"{premium_emoji('warning', '●')} <b>کد تخفیف نامعتبر، غیرفعال یا تکمیل‌شده است.</b> دوباره ارسال کن.",
             _keyboard([[_button("بازگشت", "buy:discount", "back")]]))
