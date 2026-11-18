@@ -1000,7 +1000,35 @@ def _apply_referral_commission(conn, referred_id: int, purchase_amount: int, sub
         (referrer_id, commission, before, after, f"پورسانت ۵٪ از خرید {referred_id}", f"{source}:{subscription_id}", now_ts())
     )
     return True
+def consume_pending_referral(referred_id: int) -> Optional[int]:
+    """
+    اگر پیش از تأیید عضویت اجباری، رفرال این کاربر به‌صورت موقت در settings
+    ذخیره شده بود (توسط ReferralCaptureMiddleware)، اینجا نهایی می‌شود.
+    کلید موقت در هر صورت پاک می‌شود تا دوباره استفاده نشود.
+    شناسه معرفی که ثبت شد را برمی‌گرداند، یا None.
+    """
+    referred_id = validate_telegram_id(referred_id)
+    key = f"pending_ref:{referred_id}"
+    pending = get_setting(key)
+    if not pending:
+        return None
 
+    try:
+        referrer_id = validate_telegram_id(pending)
+    except ValueError:
+        set_setting(key, "")
+        return None
+
+    set_setting(key, "")  # یک‌بار مصرف؛ فوراً پاک می‌شود
+
+    if referrer_id == referred_id:
+        return None
+    if get_referrer(referred_id):
+        return None  # قبلاً معرف دائمی دارد؛ تغییر نمی‌کند
+    if not get_user(referrer_id):
+        return None
+
+    return referrer_id if set_referral(referrer_id, referred_id) else None
 def add_referral_commission(referred_id: int, purchase_amount: int, subscription_id: int, source: str = "purchase") -> bool:
     referred_id = validate_telegram_id(referred_id)
     with get_connection() as conn:
@@ -1742,3 +1770,4 @@ def mark_user_pinned_welcome(telegram_id: int) -> bool:
         except Exception:
             conn.rollback()
             raise
+        
