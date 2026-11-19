@@ -43,6 +43,11 @@ SERVICE_VOLUME = "vol"
 SERVICE_UNLIMITED = "unl"
 MAX_DEVICES = 10
 
+
+def _free_devices_for_service(service_type: str) -> int:
+    """تعداد دستگاه رایگان بر اساس نوع سرویس."""
+    return 1 if service_type == SERVICE_UNLIMITED else MAX_DEVICES_DEFAULT
+
 _user_purchase_locks: dict[int, asyncio.Lock] = {}
 _pending_purchase_users: set[int] = set()
 
@@ -359,6 +364,69 @@ def _discount_for_order(data: dict[str, Any]) -> tuple[int, Optional[int]]:
         return 0, None
 
 
+def _validate_order_discount(data: dict[str, Any]) -> tuple[int, Optional[int]]:
+    """
+    اعتبارسنجی سخت‌گیرانه کد تخفیف پیش از نهایی‌سازی سفارش.
+    در صورت نامعتبر شدن تخفیف قبلی، اجازه ادامه خرید داده نمی‌شود.
+    """
+
+    discount_id = data.get("discount_id")
+    discount_code = data.get("discount_code")
+
+    try:
+        stored_percent = int(data.get("discount_percent") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("اطلاعات درصد تخفیف سفارش معتبر نیست.")
+
+    # سفارش بدون کد تخفیف
+    if not discount_id and not discount_code:
+        if stored_percent != 0:
+            raise ValueError("اطلاعات تخفیف سفارش ناسازگار است.")
+        return 0, None
+
+    # اطلاعات ناقص کد تخفیف
+    if not discount_id or not discount_code:
+        raise ValueError("اطلاعات کد تخفیف ناقص است.")
+
+    try:
+        code = get_discount_code(str(discount_code).strip())
+    except Exception as exc:
+        logger.exception("Final discount lookup failed")
+        raise ValueError("بررسی کد تخفیف ناموفق بود.") from exc
+
+    if not code:
+        raise ValueError("کد تخفیف دیگر وجود ندارد.")
+
+    try:
+        current_id = int(code.get("id", 0))
+        expected_id = int(discount_id)
+        used_count = int(code.get("used_count", 0))
+        max_uses = int(code.get("max_uses", 0))
+        current_percent = int(code.get("percent", 0))
+    except (TypeError, ValueError):
+        raise ValueError("اطلاعات کد تخفیف معتبر نیست.")
+
+    if current_id != expected_id:
+        raise ValueError("کد تخفیف سفارش تغییر کرده است.")
+
+    if not code.get("is_active"):
+        raise ValueError("کد تخفیف غیرفعال شده است.")
+
+    if max_uses <= 0 or used_count >= max_uses:
+        raise ValueError("ظرفیت استفاده از کد تخفیف تکمیل شده است.")
+
+    if not discount_usable_by(code, int(data.get("user_id", 0))):
+        raise ValueError("کد تخفیف برای شما معتبر نیست یا منقضی شده است.")
+
+    if not 1 <= current_percent <= 100:
+        raise ValueError("درصد کد تخفیف معتبر نیست.")
+
+    if current_percent != stored_percent:
+        raise ValueError("درصد کد تخفیف تغییر کرده است.")
+
+    return current_percent, expected_id
+
+
 def _price_with_product_base(product: dict, key: str, volume: float, days: int, devices: int, currency: str) -> int:
     """PRICE-01: قیمتِ ذخیره‌شده در محصول (که ادمین دستی تعیین کرده) مبنای قیمت است.
     اضافه‌ها (ماه/دستگاه/بدون‌محدودیت) به‌صورت «اختلاف فرمول سفارش با فرمول پیکربندی پایهٔ محصول»
@@ -372,7 +440,8 @@ def _price_with_product_base(product: dict, key: str, volume: float, days: int, 
         return formula
     if stored <= 0:
         return formula
-    base_formula = calc(key, volume, base_days, MAX_DEVICES_DEFAULT)
+    base_devices = 1 if product.get("kind") == "unl" else MAX_DEVICES_DEFAULT
+    base_formula = calc(key, volume, base_days, base_devices)
     return max(0, stored + (formula - base_formula))
 
 
@@ -443,15 +512,25 @@ async def _show_time_step(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def _show_device_step(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    devices = max(1, min(MAX_DEVICES, int(data.get("devices", MAX_DEVICES_DEFAULT))))
-    unit_dev = get_price("unl_device" if data.get("service_type") == SERVICE_UNLIMITED else "vol_device", "toman")
-    extra = max(0, devices - MAX_DEVICES_DEFAULT) * unit_dev
+
+    free_devices = _free_devices_for_service(
+        data.get("service_type", SERVICE_VOLUME)
+    )
+    devices = max(1, min(MAX_DEVICES, int(data.get("devices", free_devices))))
+
+    unit_dev = get_price(
+        "unl_device" if data.get("service_type") == SERVICE_UNLIMITED else "vol_device",
+        "toman",
+    )
+    extra = max(0, devices - free_devices) * unit_dev
+
     text = (f"{premium_emoji('telegram', '●')} <b>تعداد دستگاه‌های مجاز</b>\n\n"
             f"سرویس: <b>{_safe_text(_service_title(data))}</b>\n"
             f"تعداد دستگاه: <b>{devices}</b>\n"
-            f"دستگاه رایگان: <b>{MAX_DEVICES_DEFAULT}</b>\n"
+            f"دستگاه رایگان: <b>{free_devices}</b>\n"
             f"هزینه دستگاه اضافه: <b>{extra:,} تومان</b>\n\n"
             "تعداد دستگاه‌های موردنیازت را انتخاب کن.")
+
     await _edit_callback(callback, state, text, buy_device_selection_keyboard(devices))
 
 
@@ -554,11 +633,37 @@ def _refund(user_id: int, amount: int, order_key: str, description: str) -> bool
 async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: PaxivaClient) -> tuple[str, Any]:
     if not _valid_purchase_data(data):
         return "failed", "اطلاعات سفارش معتبر نیست."
+
     try:
-        price_toman, _price_stars, _discount_percent, discount_id = _build_order_prices(data)
+        # اعتبارسنجی سخت‌گیرانه کد تخفیف پیش از نهایی‌سازی سفارش
+        discount_data = dict(data)
+        discount_data["user_id"] = user_id
+
+        discount_percent, discount_id = _validate_order_discount(discount_data)
+
+        # محاسبه مجدد قیمت با اطلاعات فعلی محصول و تخفیف
+        price_toman, _price_stars, current_discount, current_discount_id = (
+            _build_order_prices(discount_data)
+        )
+
+        # کنترل تطابق تخفیف ذخیره‌شده با تخفیف فعلی
+        if current_discount_id != discount_id:
+            raise ValueError("کد تخفیف سفارش تغییر کرده است.")
+
+        if current_discount != discount_percent:
+            raise ValueError("درصد تخفیف سفارش تغییر کرده است.")
+
+    except ValueError as exc:
+        logger.warning(
+            "Purchase discount validation rejected: user=%s reason=%s",
+            user_id,
+            exc,
+        )
+        return "failed", str(exc)
+
     except Exception:
         logger.exception("Final purchase price validation failed")
-        return "failed", "محاسبه مبلغ سفارش ناموفق بود."
+        return "failed", "بررسی اعتبار تخفیف یا محاسبه مبلغ سفارش ناموفق بود."
 
     order_key = str(data.get("idempotency_key") or "")
     if not order_key:
@@ -598,7 +703,7 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
         create_started = True
         client_data = await paxiva.create_client(
             name=config_name, volume_gb=volume, days=days, devices=devices,
-            idempotency_key=order_key, kind=kind,
+            idempotency_key=order_key, kind="vol",
         )
         create_response_received = True
         if not isinstance(client_data, dict):
@@ -787,7 +892,7 @@ async def select_unlimited_type(callback: CallbackQuery, state: FSMContext):
     if not await _current_purchase(callback, state):
         return
     await state.update_data(service_type=SERVICE_UNLIMITED, product_id=None, volume_gb=None,
-        days=None, months=1, devices=MAX_DEVICES_DEFAULT, discount_id=None,
+        days=None, months=1, devices=1, discount_id=None,
         discount_code=None, discount_percent=0, purchase_processing=False, purchase_pending=False)
     await _edit_callback(callback, state,
         f"{premium_emoji('world', '●')} <b>انتخاب سرویس نامحدود</b>\n\n"
@@ -828,8 +933,10 @@ async def select_product(callback: CallbackQuery, state: FSMContext):
         return
 
     volume = float(product["volume_gb"])
+    free_devices = 1 if product["kind"] == "unl" else MAX_DEVICES_DEFAULT
+
     await state.update_data(product_id=product_id, volume_gb=volume, volume_key=str(product_id),
-        devices=MAX_DEVICES_DEFAULT, discount_id=None, discount_code=None, discount_percent=0)
+        devices=free_devices, discount_id=None, discount_code=None, discount_percent=0)
 
     if product["kind"] == "unl" and volume <= 0:
         # نامحدود بی‌نهایت: بدون انتخاب مدت
