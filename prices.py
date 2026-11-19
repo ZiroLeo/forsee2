@@ -13,7 +13,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from config import (
-    ADMIN_ID,
     PREMIUM_EMOJIS,
     PREMIUM_EMOJI_ENABLED,
 )
@@ -24,10 +23,12 @@ from database import (
     log_event,
 )
 from rich import premium_emoji
+from .admin_ui import protect  # ← SEC-02: گارد یکدست
 
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_prices")
+protect(router)  # فقط ادمین اصلی؛ چک تکی از هر هندلر حذف شد
 
 
 # ============================================================
@@ -64,13 +65,23 @@ PRICE_ITEMS = {
     },
 
     "unl_device": {
-        "title": "هر یوزر اضافه نامحدود",
-        "description": "هزینه هر دستگاه اضافه در سرویس نامحدود",
+        "title": "هر یوزر اضافه نامحدود بی‌نهایت",
+        "description": "هزینه هر یوزر اضافه در سرویس نامحدود بی‌نهایت",
         "toman_key": "per_device_unl_price",
         "stars_key": "per_device_unl_stars",
         "default_toman": 15000,
         "default_stars": 5,
         "emoji": "world",
+    },
+
+    "unl_fair_device": {
+        "title": "هر یوزر اضافه نامحدود منصفانه",
+        "description": "هزینه هر یوزر اضافه در سرویس نامحدود منصفانه",
+        "toman_key": "per_device_unl_fair_price",
+        "stars_key": "per_device_unl_fair_stars",
+        "default_toman": 15000,
+        "default_stars": 5,
+        "emoji": "diamond",
     },
 
     "vol_month": {
@@ -128,10 +139,6 @@ MAX_STARS_PRICE = 1_000_000
 # ============================================================
 # HELPERS
 # ============================================================
-
-def is_admin(user_id: Optional[int]) -> bool:
-    return user_id is not None and user_id == ADMIN_ID
-
 
 def get_emoji_id(key: str) -> Optional[str]:
     if not PREMIUM_EMOJI_ENABLED:
@@ -271,21 +278,6 @@ def log_price_change(
         logger.exception("Could not log price update")
 
 
-async def check_callback_admin(callback: CallbackQuery) -> bool:
-    if not is_admin(callback.from_user.id if callback.from_user else None):
-        try:
-            await callback.answer(
-                f"{premium_emoji('false', '⛔')} دسترسی غیرمجاز است.",
-                show_alert=True,
-            )
-        except Exception:
-            logger.exception("Could not answer unauthorized callback")
-
-        return False
-
-    return True
-
-
 # ============================================================
 # MAIN PRICE MENU
 # ============================================================
@@ -314,10 +306,18 @@ def prices_menu_keyboard() -> InlineKeyboardMarkup:
                 "telegram",
             ),
             make_button(
-                "یوزر اضافه نامحدود",
+                "یوزر اضافه نامحدود بی‌نهایت",
                 "admin:prices:edit:unl_device",
                 "primary",
                 "world",
+            ),
+        ],
+        [
+            make_button(
+                "یوزر اضافه نامحدود منصفانه",
+                "admin:prices:edit:unl_fair_device",
+                "success",
+                "diamond",
             ),
         ],
         [
@@ -380,9 +380,6 @@ async def show_prices_menu(
     callback: CallbackQuery,
     state: Optional[FSMContext] = None,
 ) -> None:
-    if not await check_callback_admin(callback):
-        return
-
     if state:
         await state.clear()
 
@@ -465,9 +462,6 @@ async def select_price_item(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-    if not await check_callback_admin(callback):
-        return
-
     item_key = callback.data.split(":")[-1]
 
     item = PRICE_ITEMS.get(item_key)
@@ -575,9 +569,6 @@ async def select_currency(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-    if not await check_callback_admin(callback):
-        return
-
     parts = callback.data.split(":")
 
     if len(parts) != 5:
@@ -615,9 +606,6 @@ async def receive_new_price(
     state: FSMContext,
 ):
     user = message.from_user
-
-    if not user or not is_admin(user.id):
-        return
 
     data = await state.get_data()
 
@@ -768,9 +756,6 @@ async def cancel_price_edit(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-    if not await check_callback_admin(callback):
-        return
-
     await state.clear()
 
     try:
