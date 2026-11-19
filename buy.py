@@ -253,13 +253,14 @@ def buy_volume_selection_keyboard(service_type: str) -> InlineKeyboardMarkup:
         for i in range(0, len(products), 2):
             row = []
             for p in products[i:i + 2]:
-                label = (
-                    f"{p['volume_gb']:g} گیگ"
-                    if p["kind"] == "vol" and p["volume_gb"] > 0
-                    else ("نامحدود ۱۵۰ گیگ" if p["volume_gb"] > 0 else "نامحدود بی‌نهایت")
-                    if p["kind"] == "unl"
-                    else f"{p['volume_gb']:g} گیگ"
-                )
+                if p["kind"] == "unl":
+                    label = (
+                        f"نامحدود {float(p['volume_gb']):g} گیگ"
+                        if float(p["volume_gb"]) > 0
+                        else "نامحدود بی‌نهایت"
+                    )
+                else:
+                    label = f"{float(p['volume_gb']):g} گیگ"
                 row.append(_button(label, f"buy:prod:{p['id']}", "blue_dot" if p["kind"] == "vol" else "diamond"))
             rows.append(row)
 
@@ -518,10 +519,22 @@ async def _show_device_step(callback: CallbackQuery, state: FSMContext) -> None:
     )
     devices = max(1, min(MAX_DEVICES, int(data.get("devices", free_devices))))
 
-    unit_dev = get_price(
-        "unl_device" if data.get("service_type") == SERVICE_UNLIMITED else "vol_device",
-        "toman",
-    )
+    product_id = data.get("product_id")
+    product = get_product(int(product_id)) if product_id else None
+
+    if data.get("service_type") == SERVICE_UNLIMITED:
+        is_fair_unlimited = (
+            product is not None
+            and float(product.get("volume_gb") or 0) > 0
+        )
+
+        device_price_key = (
+            "unl_fair_device" if is_fair_unlimited else "unl_device"
+        )
+    else:
+        device_price_key = "vol_device"
+
+    unit_dev = get_price(device_price_key, "toman")
     extra = max(0, devices - free_devices) * unit_dev
 
     text = (f"{premium_emoji('telegram', '●')} <b>تعداد دستگاه‌های مجاز</b>\n\n"
@@ -1008,7 +1021,7 @@ async def back_to_time(callback: CallbackQuery, state: FSMContext):
     product_id = data.get("product_id")
     product = get_product(int(product_id)) if product_id else None
     if product and product["kind"] == "unl" and float(product["volume_gb"]) <= 0:
-        await _show_device_step(callback, state)
+        await _show_volume_step(callback, state)
     elif product:
         await _show_time_step(callback, state)
     else:
