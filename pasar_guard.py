@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from urllib.parse import quote, urlparse
@@ -12,18 +13,6 @@ from urllib.parse import quote, urlparse
 import aiohttp
 
 from config import (
-    PASARGUARD_1_URL,
-    PASARGUARD_1_USERNAME,
-    PASARGUARD_1_PASSWORD,
-    PASARGUARD_1_GROUP_ID,
-    PASARGUARD_2_URL,
-    PASARGUARD_2_USERNAME,
-    PASARGUARD_2_PASSWORD,
-    PASARGUARD_2_GROUP_ID,
-    PASARGUARD_3_URL,
-    PASARGUARD_3_USERNAME,
-    PASARGUARD_3_PASSWORD,
-    PASARGUARD_3_GROUP_ID,
     UNLIMITED_PANEL_VOLUME_GB,
     UNLIMITED_PANEL_DAYS,
     VIP_PANEL_DAYS,
@@ -63,6 +52,7 @@ CB_RECOVERY_TIME = 60
 CONFIG_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{3,64}$")
 TELEGRAM_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
 _LOG_CONTROL_RE = re.compile(r"[\r\n\t\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_PANEL_NAME_CONTROL_RE = _LOG_CONTROL_RE
 
 _SENSITIVE_WORDS = (
     "authorization", "bearer", "access_token",
@@ -83,6 +73,38 @@ class PasarGuardError(Exception):
 
 class PasarGuardCircuitOpen(PasarGuardError):
     pass
+
+
+# =========================================================
+# PANEL CONFIG (جدید — جایگزین PASARGUARD_1/2/3 در config.py)
+# =========================================================
+
+@dataclass
+class PanelConfig:
+    """
+    مشخصات یک پنل PasarGuard که ادمین از داخل پنل ادمین وارد و در دیتابیس
+    ذخیره کرده است. تعداد پنل‌ها دیگر ثابت (۱،۲،۳) نیست؛ هرچقدر ادمین
+    اضافه کند، همان‌قدر ردیف در دیتابیس و همان‌قدر PanelConfig وجود دارد.
+    """
+    id: int
+    name: str          # اسم دلخواه ادمین، فقط برای نمایش و سازمان‌دهی
+    url: str
+    username: str
+    password: str
+    group_id: Optional[int] = None
+
+
+def _validate_panel_name(name: Any) -> str:
+    if not name:
+        raise PasarGuardError("Panel name is required.")
+    try:
+        name = str(name).strip()
+    except Exception:
+        raise PasarGuardError("Invalid panel name.")
+    name = _PANEL_NAME_CONTROL_RE.sub(" ", name)
+    if not name or len(name) > 50:
+        raise PasarGuardError("Panel name must be 1-50 characters.")
+    return name
 
 
 # =========================================================
@@ -215,36 +237,28 @@ def _default_port_for_scheme(scheme: str) -> int:
 
 class PasarGuardAPI:
 
-    def __init__(self, panel: int = 1):
-        self.panel = panel
+    def __init__(self, panel: PanelConfig):
+        if not isinstance(panel, PanelConfig):
+            raise PasarGuardError("PasarGuardAPI requires a PanelConfig instance.")
 
-        # ✅ FIX: elif به‌جای else — جلوگیری از باگ silent برای panel=3
-        if panel == 1:
-            self.base_url = (PASARGUARD_1_URL or "").rstrip("/")
-            self.username = PASARGUARD_1_USERNAME
-            self.password = PASARGUARD_1_PASSWORD
-            group_id = PASARGUARD_1_GROUP_ID
-        elif panel == 2:
-            self.base_url = (PASARGUARD_2_URL or "").rstrip("/")
-            self.username = PASARGUARD_2_USERNAME
-            self.password = PASARGUARD_2_PASSWORD
-            group_id = PASARGUARD_2_GROUP_ID
-        elif panel == 3:
-            self.base_url = (PASARGUARD_3_URL or "").rstrip("/")
-            self.username = PASARGUARD_3_USERNAME
-            self.password = PASARGUARD_3_PASSWORD
-            group_id = PASARGUARD_3_GROUP_ID
-        else:
-            raise PasarGuardError(f"Invalid panel: {panel}")
+        self.panel_id = panel.id
+        self.panel_name = _validate_panel_name(panel.name)
+        # سازگاری با همه‌ی لاگ‌ها و خروجی‌های همین فایل که از self.panel استفاده می‌کنند
+        self.panel = self.panel_name
+
+        self.base_url = (panel.url or "").rstrip("/")
+        self.username = panel.username
+        self.password = panel.password
+        group_id = panel.group_id
 
         if not self.base_url:
-            raise PasarGuardError(f"Panel {panel} URL is missing.")
+            raise PasarGuardError(f"Panel '{self.panel_name}' URL is missing.")
 
         if not self.username or not self.password:
-            raise PasarGuardError(f"Panel {panel} credentials are missing.")
+            raise PasarGuardError(f"Panel '{self.panel_name}' credentials are missing.")
 
         if not (self.base_url.startswith("http://") or self.base_url.startswith("https://")):
-            raise PasarGuardError(f"Panel {panel} URL must start with http/https.")
+            raise PasarGuardError(f"Panel '{self.panel_name}' URL must start with http/https.")
 
         try:
             parsed = urlparse(self.base_url)
@@ -259,7 +273,7 @@ class PasarGuardAPI:
             self.base_port = None
 
         if not self.base_hostname:
-            raise PasarGuardError(f"Panel {panel} URL is invalid.")
+            raise PasarGuardError(f"Panel '{self.panel_name}' URL is invalid.")
 
         self.group_id: Optional[int] = None
         if group_id is not None:
@@ -269,8 +283,8 @@ class PasarGuardAPI:
                     self.group_id = gid
             except (ValueError, TypeError):
                 logger.warning(
-                    "Panel %s: invalid group_id: %s",
-                    panel,
+                    "Panel '%s': invalid group_id: %s",
+                    self.panel_name,
                     _sanitize_for_log(group_id),
                 )
 
@@ -281,7 +295,7 @@ class PasarGuardAPI:
         self._cb_failures = 0
         self._cb_opened_at = 0.0
 
-    # =====================================================
+    # ===================================================== 
     # SESSION
     # =====================================================
 
@@ -353,14 +367,13 @@ class PasarGuardAPI:
 
         return value or "Unknown error."
 
-     # =====================================================
+    # =====================================================
     # URL SAFETY
     # =====================================================
 
     def _is_safe_url(self, url: str) -> bool:
         """
-        ✅ FIX: قبول subdomainهای همخانوادهی base_hostname.
-        ...
+        ✅ FIX: قبول subdomainهای همخانواده‌ی base_hostname.
         """
         if not url:
             return False
@@ -377,11 +390,9 @@ class PasarGuardAPI:
             if not base_host:
                 return False
 
-            # ✅ exact match
             if hostname == base_host:
                 return True
 
-            # ✅ same root domain check
             def _root_domain(h: str) -> str:
                 parts = h.split(".")
                 if len(parts) < 2:
@@ -397,8 +408,6 @@ class PasarGuardAPI:
                 )
                 return False
 
-            # ✅ پورت رو سخت‌گیرانه چک نمی‌کنیم
-            # بعضی پنل‌ها subscription_url رو با پورت متفاوت برمی‌گردونن
             actual_port = parsed.port
             if actual_port is not None:
                 if not (1 <= actual_port <= 65535):
@@ -407,7 +416,7 @@ class PasarGuardAPI:
             return True
         except Exception:
             return False
-        
+
     # =====================================================
     # SUBSCRIPTION URL
     # =====================================================
@@ -613,8 +622,6 @@ class PasarGuardAPI:
                         self._record_failure()
                         await _global_cb.record_failure()
 
-                    # ✅ FIX: استخراج پیام دقیق از پاسخ پنل
-                    # (مثل "Group not found" که قبلاً به‌عنوان "API error 404" نشون داده می‌شد)
                     error_detail = ""
                     try:
                         err_data = await response.json(content_type=None)
@@ -629,7 +636,6 @@ class PasarGuardAPI:
                         pass
 
                     if not error_detail:
-                        # اگه JSON نبود، متن خام رو (اگه کوتاه و امن بود) استفاده کن
                         raw = (text or "").strip()
                         if raw and len(raw) <= 200 and "<" not in raw and ">" not in raw:
                             error_detail = raw
@@ -868,6 +874,7 @@ class PasarGuardAPI:
             "hwid_limit": hwid_limit,
             "group_ids": group_ids,
             "panel": self.panel,
+            "panel_id": self.panel_id,
             "raw": data,
         }
 
@@ -1268,6 +1275,7 @@ class PasarGuardAPI:
             "text": "\n".join(config_links),
             "count": len(config_links),
             "panel": self.panel,
+            "panel_id": self.panel_id,
         }
 
     # =====================================================
@@ -1306,137 +1314,167 @@ class PasarGuardAPI:
 
 
 # =========================================================
-# SINGLETON INSTANCES
+# PANEL REGISTRY (جدید — جایگزین سینگلتون‌های ثابت ۱/۲/۳)
 # =========================================================
 
-_pasarguard_1: Optional[PasarGuardAPI] = None
-_pasarguard_2: Optional[PasarGuardAPI] = None
-_pasarguard_3: Optional[PasarGuardAPI] = None
+class PanelRegistry:
+    """
+    به‌جای _pasarguard_1/2/3 ثابت، کلاینت هر پنل را بر اساس panel_id از
+    دیتابیس می‌سازد و کش می‌کند. تعداد پنل‌ها هرچقدر ادمین اضافه کرده باشد
+    همان‌قدر است.
+
+    وابسته به توابعی در database.py که هنوز ساخته نشده‌اند:
+        get_panel(panel_id) -> dict | None
+    قدم بعدی، ساخت جدول panels و این تابع در database.py است.
+    """
+
+    def __init__(self):
+        self._clients: Dict[int, PasarGuardAPI] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_client(self, panel_id: int) -> PasarGuardAPI:
+        if panel_id in self._clients:
+            return self._clients[panel_id]
+
+        async with self._lock:
+            if panel_id in self._clients:
+                return self._clients[panel_id]
+
+            from database import get_panel  # TODO: در قدم بعدی ساخته می‌شود
+
+            row = get_panel(panel_id)
+            if not row:
+                raise PasarGuardError(f"Panel #{panel_id} not found in database.")
+
+            config = PanelConfig(
+                id=row["id"],
+                name=row["name"],
+                url=row["url"],
+                username=row["username"],
+                password=row["password"],
+                group_id=row.get("group_id"),
+            )
+            client = PasarGuardAPI(config)
+            self._clients[panel_id] = client
+            return client
+
+    def invalidate(self, panel_id: int) -> None:
+        """بعد از ادیت یا حذف یک پنل در پنل ادمین، کلاینت کش‌شده پاک می‌شود."""
+        self._clients.pop(panel_id, None)
+
+    async def close_all(self) -> None:
+        for client in list(self._clients.values()):
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("Error closing a panel client.")
+        self._clients.clear()
+
+    @staticmethod
+    async def test_panel_connection(
+        url: str,
+        username: str,
+        password: str,
+        group_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """تست یک پنل قبل از ذخیره در دیتابیس (فرم «افزودن پنل جدید»)."""
+        temp_config = PanelConfig(
+            id=0, name="__test__", url=url, username=username,
+            password=password, group_id=group_id,
+        )
+        client = PasarGuardAPI(temp_config)
+        try:
+            return await client.test_connection()
+        finally:
+            await client.close()
 
 
-def _get_panel(panel: int) -> PasarGuardAPI:
-    global _pasarguard_1, _pasarguard_2, _pasarguard_3
-
-    if panel == 1:
-        if _pasarguard_1 is None:
-            _pasarguard_1 = PasarGuardAPI(panel=1)
-        return _pasarguard_1
-
-    if panel == 2:
-        if _pasarguard_2 is None:
-            _pasarguard_2 = PasarGuardAPI(panel=2)
-        return _pasarguard_2
-
-    if panel == 3:
-        if _pasarguard_3 is None:
-            _pasarguard_3 = PasarGuardAPI(panel=3)
-        return _pasarguard_3
-
-    raise PasarGuardError(f"Invalid panel: {panel}")
+panel_registry = PanelRegistry()
 
 
 # =========================================================
 # PUBLIC WRAPPERS
 # =========================================================
+# نکته‌ی مهم: همه‌ی این‌ها حالا panel_id می‌گیرند (دیگر عدد ثابت ۱/۲/۳ نیست).
+# این panel_id در آینده از رکورد محصول در دیتابیس خوانده می‌شود.
 
-def normalize_subscription_url(url: Optional[str], panel: int = 1) -> Optional[str]:
+async def normalize_subscription_url(url: Optional[str], panel_id: int) -> Optional[str]:
     try:
-        return _get_panel(panel).normalize_subscription_url(url)
+        client = await panel_registry.get_client(panel_id)
+        return client.normalize_subscription_url(url)
     except Exception:
         return None
 
 
-async def test_connection() -> Dict[str, Any]:
+async def test_connection(panel_id: int) -> Dict[str, Any]:
     try:
-        return await _get_panel(1).test_connection()
+        client = await panel_registry.get_client(panel_id)
+        return await client.test_connection()
     except Exception as e:
-        logger.exception("Panel 1 test failed")
+        logger.exception("Panel %s test failed", panel_id)
         return {"success": False, "message": str(e), "data": {}}
 
 
-async def test_connection_panel2() -> Dict[str, Any]:
-    try:
-        return await _get_panel(2).test_connection()
-    except Exception as e:
-        logger.exception("Panel 2 test failed")
-        return {"success": False, "message": str(e), "data": {}}
-
-
-async def test_connection_panel3() -> Dict[str, Any]:
-    """
-    ✅ جدید — تست اتصال پنل ۳ (VIP)
-    """
-    try:
-        return await _get_panel(3).test_connection()
-    except Exception as e:
-        logger.exception("Panel 3 test failed")
-        return {"success": False, "message": str(e), "data": {}}
+def _build_note(telegram_id: int, telegram_username: Optional[str], kind: str) -> str:
+    username_part = "N/A"
+    if telegram_username:
+        try:
+            u = str(telegram_username).strip().lstrip("@")
+            if TELEGRAM_USERNAME_RE.match(u):
+                username_part = f"@{u}"
+        except Exception:
+            pass
+    return f"Telegram ID: {telegram_id} | Username: {username_part} | Type: {kind}"
 
 
 async def create_volume_config(
     telegram_id: int,
     volume_gb: float,
     config_name: str,
+    panel_id: int,
     telegram_username: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """ساخت کانفیگ حجمی روی پنل ۱."""
+    """ساخت کانفیگ حجمی روی پنلی که ادمین برای این محصول انتخاب کرده."""
     try:
         telegram_id = int(telegram_id)
     except (ValueError, TypeError):
         raise PasarGuardError("Invalid telegram_id.")
-
     if telegram_id <= 0:
         raise PasarGuardError("Invalid telegram_id.")
 
-    username_part = "N/A"
-    if telegram_username:
-        try:
-            u = str(telegram_username).strip().lstrip("@")
-            if TELEGRAM_USERNAME_RE.match(u):
-                username_part = f"@{u}"
-        except Exception:
-            pass
+    client = await panel_registry.get_client(panel_id)
+    note = _build_note(telegram_id, telegram_username, "volume")
 
-    note = f"Telegram ID: {telegram_id} | Username: {username_part} | Type: volume"
-
-    return await _get_panel(1).create_user(
+    return await client.create_user(
         username=config_name,
         volume_gb=volume_gb,
         note=note,
-        group_id=_get_panel(1).group_id,
+        group_id=client.group_id,
     )
 
 
 async def create_unlimited_config(
     telegram_id: int,
     config_name: str,
+    panel_id: int,
     telegram_username: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """ساخت کانفیگ نامحدود روی پنل ۲."""
+    """ساخت کانفیگ نامحدود (حجم/روز ثابت از config.py) روی پنل انتخاب‌شده."""
     try:
         telegram_id = int(telegram_id)
     except (ValueError, TypeError):
         raise PasarGuardError("Invalid telegram_id.")
-
     if telegram_id <= 0:
         raise PasarGuardError("Invalid telegram_id.")
 
-    username_part = "N/A"
-    if telegram_username:
-        try:
-            u = str(telegram_username).strip().lstrip("@")
-            if TELEGRAM_USERNAME_RE.match(u):
-                username_part = f"@{u}"
-        except Exception:
-            pass
+    client = await panel_registry.get_client(panel_id)
+    note = _build_note(telegram_id, telegram_username, "unlimited")
 
-    note = f"Telegram ID: {telegram_id} | Username: {username_part} | Type: unlimited"
-
-    return await _get_panel(2).create_user(
+    return await client.create_user(
         username=config_name,
         volume_gb=UNLIMITED_PANEL_VOLUME_GB,
         note=note,
-        group_id=_get_panel(2).group_id,
+        group_id=client.group_id,
         expire_days=UNLIMITED_PANEL_DAYS,
     )
 
@@ -1445,36 +1483,25 @@ async def create_vip_config(
     telegram_id: int,
     volume_gb: float,
     config_name: str,
+    panel_id: int,
     telegram_username: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    ✅ جدید — ساخت کانفیگ VIP روی پنل ۳.
-    مثل حجمی ولی با expire_days=VIP_PANEL_DAYS (30 روز).
-    """
+    """ساخت کانفیگ VIP (روز ثابت از config.py، حجم دلخواه) روی پنل انتخاب‌شده."""
     try:
         telegram_id = int(telegram_id)
     except (ValueError, TypeError):
         raise PasarGuardError("Invalid telegram_id.")
-
     if telegram_id <= 0:
         raise PasarGuardError("Invalid telegram_id.")
 
-    username_part = "N/A"
-    if telegram_username:
-        try:
-            u = str(telegram_username).strip().lstrip("@")
-            if TELEGRAM_USERNAME_RE.match(u):
-                username_part = f"@{u}"
-        except Exception:
-            pass
+    client = await panel_registry.get_client(panel_id)
+    note = _build_note(telegram_id, telegram_username, "vip")
 
-    note = f"Telegram ID: {telegram_id} | Username: {username_part} | Type: vip"
-
-    return await _get_panel(3).create_user(
+    return await client.create_user(
         username=config_name,
         volume_gb=volume_gb,
         note=note,
-        group_id=_get_panel(3).group_id,
+        group_id=client.group_id,
         expire_days=VIP_PANEL_DAYS,
     )
 
@@ -1482,89 +1509,68 @@ async def create_vip_config(
 async def create_test_config(
     telegram_id: int,
     config_name: str,
-    volume_gb: float = None,
+    panel_id: int,
+    volume_gb: Optional[float] = None,
     telegram_username: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """ساخت کانفیگ تست روی پنل ۱."""
+    """ساخت کانفیگ تست روی پنل انتخاب‌شده."""
     try:
         telegram_id = int(telegram_id)
     except (ValueError, TypeError):
         raise PasarGuardError("Invalid telegram_id.")
-
     if telegram_id <= 0:
         raise PasarGuardError("Invalid telegram_id.")
 
     if volume_gb is None:
         volume_gb = TEST_ACCOUNT_VOLUME_GB
 
-    username_part = "N/A"
-    if telegram_username:
-        try:
-            u = str(telegram_username).strip().lstrip("@")
-            if TELEGRAM_USERNAME_RE.match(u):
-                username_part = f"@{u}"
-        except Exception:
-            pass
+    client = await panel_registry.get_client(panel_id)
+    note = _build_note(telegram_id, telegram_username, "test")
 
-    note = f"Telegram ID: {telegram_id} | Username: {username_part} | Type: test"
-
-    return await _get_panel(1).create_user(
+    return await client.create_user(
         username=config_name,
         volume_gb=volume_gb,
         note=note,
-        group_id=_get_panel(1).group_id,
+        group_id=client.group_id,
     )
 
 
 async def renew_config(
     username: str,
     additional_volume_gb: float,
-    panel: int = 1,
+    panel_id: int,
 ) -> Dict[str, Any]:
-    """
-    ✅ آپدیت شد: panel param اضافه شد تا برای VIP هم کار کنه.
-    پیش‌فرض panel=1 برای سازگاری با کد قدیمی.
-    """
-    return await _get_panel(panel).renew_config(username, additional_volume_gb)
+    client = await panel_registry.get_client(panel_id)
+    return await client.renew_config(username, additional_volume_gb)
 
 
 async def update_config_volume(
     username: str,
     change_gb: float,
-    panel: int = 1,
+    panel_id: int,
 ) -> Dict[str, Any]:
-    return await _get_panel(panel).update_config_volume(username, change_gb)
+    client = await panel_registry.get_client(panel_id)
+    return await client.update_config_volume(username, change_gb)
 
 
-async def get_config_info(username: str, panel: int = 1) -> Dict[str, Any]:
-    return await _get_panel(panel).get_config_info(username)
+async def get_config_info(username: str, panel_id: int) -> Dict[str, Any]:
+    client = await panel_registry.get_client(panel_id)
+    return await client.get_config_info(username)
 
 
-async def get_full_config(username: str, panel: int = 1) -> Dict[str, Any]:
-    return await _get_panel(panel).get_full_config(username)
+async def get_full_config(username: str, panel_id: int) -> Dict[str, Any]:
+    client = await panel_registry.get_client(panel_id)
+    return await client.get_full_config(username)
 
 
 async def delete_config(
+    panel_id: int,
     username: Optional[str] = None,
     user_id: Optional[int] = None,
-    panel: int = 1,
 ) -> Dict[str, Any]:
-    return await _get_panel(panel).delete_config(
-        username=username,
-        user_id=user_id,
-    )
+    client = await panel_registry.get_client(panel_id)
+    return await client.delete_config(username=username, user_id=user_id)
 
 
 async def close_connection():
-    global _pasarguard_1, _pasarguard_2, _pasarguard_3
-
-    for p in (_pasarguard_1, _pasarguard_2, _pasarguard_3):
-        if p is not None:
-            try:
-                await p.close()
-            except Exception:
-                pass
-
-    _pasarguard_1 = None
-    _pasarguard_2 = None
-    _pasarguard_3 = None
+    await panel_registry.close_all()
