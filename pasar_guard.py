@@ -12,14 +12,6 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 
-from config import (
-    UNLIMITED_PANEL_VOLUME_GB,
-    UNLIMITED_PANEL_DAYS,
-    VIP_PANEL_DAYS,
-    TEST_ACCOUNT_VOLUME_GB,
-)
-
-
 # =========================================================
 # LOGGING
 # =========================================================
@@ -892,11 +884,17 @@ class PasarGuardAPI:
         expire_days: Optional[int] = None,
     ) -> Dict[str, Any]:
         username = _validate_username(username)
-        volume_gb = _validate_volume(volume_gb)
-
-        data_limit = int(volume_gb * BYTES_PER_GB)
-        if data_limit <= 0:
-            raise PasarGuardError("Calculated data limit is invalid.")
+        try:
+            unlimited_volume = float(volume_gb) == 0
+        except (TypeError, ValueError):
+            raise PasarGuardError("Invalid volume.")
+        if unlimited_volume:
+            data_limit = 0  # در پاسارگارد data_limit=0 یعنی حجم نامحدود
+        else:
+            volume_gb = _validate_volume(volume_gb)
+            data_limit = int(volume_gb * BYTES_PER_GB)
+            if data_limit <= 0:
+                raise PasarGuardError("Calculated data limit is invalid.")
 
         try:
             existing = await self.user_exists(username)
@@ -1323,9 +1321,7 @@ class PanelRegistry:
     دیتابیس می‌سازد و کش می‌کند. تعداد پنل‌ها هرچقدر ادمین اضافه کرده باشد
     همان‌قدر است.
 
-    وابسته به توابعی در database.py که هنوز ساخته نشده‌اند:
-        get_panel(panel_id) -> dict | None
-    قدم بعدی، ساخت جدول panels و این تابع در database.py است.
+    وابسته به database.get_panel(panel_id) -> dict | None
     """
 
     def __init__(self):
@@ -1340,7 +1336,7 @@ class PanelRegistry:
             if panel_id in self._clients:
                 return self._clients[panel_id]
 
-            from database import get_panel  # TODO: در قدم بعدی ساخته می‌شود
+            from database import get_panel
 
             row = get_panel(panel_id)
             if not row:
@@ -1453,88 +1449,6 @@ async def create_volume_config(
     )
 
 
-async def create_unlimited_config(
-    telegram_id: int,
-    config_name: str,
-    panel_id: int,
-    telegram_username: Optional[str] = None,
-) -> Dict[str, Any]:
-    """ساخت کانفیگ نامحدود (حجم/روز ثابت از config.py) روی پنل انتخاب‌شده."""
-    try:
-        telegram_id = int(telegram_id)
-    except (ValueError, TypeError):
-        raise PasarGuardError("Invalid telegram_id.")
-    if telegram_id <= 0:
-        raise PasarGuardError("Invalid telegram_id.")
-
-    client = await panel_registry.get_client(panel_id)
-    note = _build_note(telegram_id, telegram_username, "unlimited")
-
-    return await client.create_user(
-        username=config_name,
-        volume_gb=UNLIMITED_PANEL_VOLUME_GB,
-        note=note,
-        group_id=client.group_id,
-        expire_days=UNLIMITED_PANEL_DAYS,
-    )
-
-
-async def create_vip_config(
-    telegram_id: int,
-    volume_gb: float,
-    config_name: str,
-    panel_id: int,
-    telegram_username: Optional[str] = None,
-) -> Dict[str, Any]:
-    """ساخت کانفیگ VIP (روز ثابت از config.py، حجم دلخواه) روی پنل انتخاب‌شده."""
-    try:
-        telegram_id = int(telegram_id)
-    except (ValueError, TypeError):
-        raise PasarGuardError("Invalid telegram_id.")
-    if telegram_id <= 0:
-        raise PasarGuardError("Invalid telegram_id.")
-
-    client = await panel_registry.get_client(panel_id)
-    note = _build_note(telegram_id, telegram_username, "vip")
-
-    return await client.create_user(
-        username=config_name,
-        volume_gb=volume_gb,
-        note=note,
-        group_id=client.group_id,
-        expire_days=VIP_PANEL_DAYS,
-    )
-
-
-async def create_test_config(
-    telegram_id: int,
-    config_name: str,
-    panel_id: int,
-    volume_gb: Optional[float] = None,
-    telegram_username: Optional[str] = None,
-) -> Dict[str, Any]:
-    """ساخت کانفیگ تست روی پنل انتخاب‌شده."""
-    try:
-        telegram_id = int(telegram_id)
-    except (ValueError, TypeError):
-        raise PasarGuardError("Invalid telegram_id.")
-    if telegram_id <= 0:
-        raise PasarGuardError("Invalid telegram_id.")
-
-    if volume_gb is None:
-        volume_gb = TEST_ACCOUNT_VOLUME_GB
-
-    client = await panel_registry.get_client(panel_id)
-    note = _build_note(telegram_id, telegram_username, "test")
-
-    return await client.create_user(
-        username=config_name,
-        volume_gb=volume_gb,
-        note=note,
-        group_id=client.group_id,
-    )
-
-
 async def renew_config(
     username: str,
     additional_volume_gb: float,
@@ -1570,6 +1484,271 @@ async def delete_config(
 ) -> Dict[str, Any]:
     client = await panel_registry.get_client(panel_id)
     return await client.delete_config(username=username, user_id=user_id)
+
+
+# =========================================================
+# SUBSCRIPTION-LEVEL API (لایهٔ سازگاری با کد قدیمی PAXIVA)
+# =========================================================
+# همهٔ توابع این بخش یک «sub» (ردیف جدول subscriptions شامل panel_id و
+# config_name) می‌گیرند، پنل را از panel_registry پیدا می‌کنند و با username
+# (= config_name) کار می‌کنند. خروجی get_live/renew_days/... همان شکل دیکشنری
+# PAXIVA است تا lifecycle/scheduler/renew/services با کمترین تغییر کار کنند:
+#   {"name","link","used_bytes","volume_gb"(0=نامحدود),"expires_at"(ts|None),
+#    "state","devices","panel_id"}
+
+USER_RESET_PATH_TEMPLATE = "/api/user/{username}/reset"
+
+_STATE_MAP = {
+    "active": "active",
+    "on_hold": "active",
+    "limited": "depleted",
+    "expired": "expired",
+    "disabled": "disabled",
+}
+
+_IDEM_TTL = 24 * 3600
+_IDEM_MAX = 2000
+_idem_cache: "Dict[str, tuple]" = {}          # key -> (monotonic_ts, result)
+_user_locks: "Dict[str, asyncio.Lock]" = {}   # panel:username -> Lock
+
+
+def _to_ts(value: Any) -> Optional[int]:
+    """expire پاسارگارد (عدد/رشتهٔ عددی/ISO) → timestamp ثانیه؛ None/0 = بدون انقضا."""
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            n = int(value)
+        elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            n = int(value.strip())
+        elif isinstance(value, str):
+            text = value.strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            n = int(dt.timestamp())
+        else:
+            return None
+    except (ValueError, OverflowError, OSError):
+        return None
+    if n > 10_000_000_000:  # میلی‌ثانیه
+        n //= 1000
+    return n if n > 0 else None
+
+
+def is_not_found(exc: BaseException) -> bool:
+    return isinstance(exc, PasarGuardError) and getattr(exc, "status", None) == 404
+
+
+def is_definite_rejection(exc: BaseException) -> bool:
+    """
+    رد قطعی = پنل درخواست را قطعاً اعمال نکرده (قابل بازگشت وجه):
+    خطای 4xx (جز 408/425/429) یا باز بودن circuit breaker (درخواست اصلاً ارسال نشده).
+    timeout/قطع شبکه/5xx = نامطمئن.
+    """
+    if isinstance(exc, PasarGuardCircuitOpen):
+        return True
+    if not isinstance(exc, PasarGuardError):
+        return False
+    status = getattr(exc, "status", None)
+    return status is not None and 400 <= int(status) < 500 and int(status) not in (408, 425, 429)
+
+
+def _sub_ref(sub: Any) -> "tuple[int, str]":
+    try:
+        data = dict(sub)
+    except Exception:
+        raise PasarGuardError("Invalid subscription record.")
+    panel_id = data.get("panel_id")
+    username = data.get("config_name")
+    if not panel_id:
+        raise PasarGuardError("Subscription has no panel_id.")
+    try:
+        panel_id = int(panel_id)
+    except (TypeError, ValueError):
+        raise PasarGuardError("Subscription has an invalid panel_id.")
+    return panel_id, _validate_username(username)
+
+
+def _lock_for(panel_id: int, username: str) -> asyncio.Lock:
+    key = f"{panel_id}:{username}"
+    lock = _user_locks.get(key)
+    if lock is None:
+        if len(_user_locks) > 5000:
+            for k in [k for k, v in _user_locks.items() if not v.locked()][:2500]:
+                _user_locks.pop(k, None)
+        lock = _user_locks[key] = asyncio.Lock()
+    return lock
+
+
+def _idem_get(key: Optional[str]):
+    if not key:
+        return None
+    entry = _idem_cache.get(key)
+    if entry and time.monotonic() - entry[0] < _IDEM_TTL:
+        return entry[1]
+    return None
+
+
+def _idem_put(key: Optional[str], result: Dict[str, Any]) -> None:
+    if not key:
+        return
+    if len(_idem_cache) >= _IDEM_MAX:
+        for k in sorted(_idem_cache, key=lambda x: _idem_cache[x][0])[: _IDEM_MAX // 2]:
+            _idem_cache.pop(k, None)
+    _idem_cache[key] = (time.monotonic(), result)
+
+
+def to_client_view(client: "PasarGuardAPI", user: Dict[str, Any], panel_id: int) -> Dict[str, Any]:
+    """پاسخ خام پاسارگارد → دیکشنری هم‌شکل PAXIVA."""
+    try:
+        limit = int(user.get("data_limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    used = int(client._extract_usage(user))
+    expires_at = _to_ts(user.get("expire") or user.get("expire_date") or user.get("expiration"))
+    raw_status = client._extract_status(user) or "active"
+    state = _STATE_MAP.get(raw_status, "active")
+    now = int(time.time())
+    if state == "active":
+        if limit > 0 and used >= limit:
+            state = "depleted"
+        elif expires_at is not None and expires_at <= now:
+            state = "expired"
+    return {
+        "name": user.get("username"),
+        "link": client._extract_subscription_url(user),
+        "used_bytes": max(0, used),
+        "volume_gb": (limit / BYTES_PER_GB) if limit > 0 else 0,
+        "expires_at": expires_at,
+        "state": state,
+        "devices": user.get("hwid_limit"),
+        "panel_id": panel_id,
+        "panel_status": raw_status,
+    }
+
+
+async def _load(sub: Any) -> "tuple[PasarGuardAPI, int, str, Dict[str, Any]]":
+    panel_id, username = _sub_ref(sub)
+    client = await panel_registry.get_client(panel_id)
+    user = await client.get_user(username)
+    if not user:
+        raise PasarGuardError("User not found.", status=404)
+    return client, panel_id, username, user
+
+
+async def get_live(sub: Any) -> Dict[str, Any]:
+    """وضعیت زندهٔ یک اشتراک از پنل (برای lifecycle و نمایش سرویس)."""
+    client, panel_id, _username, user = await _load(sub)
+    return to_client_view(client, user, panel_id)
+
+
+async def renew_days(sub: Any, days: int, idem_key: Optional[str] = None) -> Dict[str, Any]:
+    """
+    افزودن days روز به انقضا: max(انقضای فعلی، الان) + days.
+    * پاسارگارد idempotency ندارد؛ کلید در حافظه نگه داشته می‌شود تا تکرار همان
+      درخواست (retry) دوباره روز اضافه نکند. (با ری‌استارت ربات پاک می‌شود.)
+    * خواندن-تغییر-نوشتن با قفل per-user انجام می‌شود تا دو تمدید هم‌زمان گم نشوند.
+    """
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        raise PasarGuardError("Invalid days.", status=400)
+    if days <= 0 or days > 3650:
+        raise PasarGuardError("Days out of range.", status=400)
+
+    cached = _idem_get(idem_key)
+    if cached is not None:
+        return cached
+
+    panel_id, username = _sub_ref(sub)
+    async with _lock_for(panel_id, username):
+        cached = _idem_get(idem_key)
+        if cached is not None:
+            return cached
+
+        client, panel_id, username, user = await _load(sub)
+        now = int(time.time())
+        current = _to_ts(user.get("expire") or user.get("expire_date") or user.get("expiration"))
+        new_expire = max(current or 0, now) + days * 86400
+
+        payload: Dict[str, Any] = {"expire": new_expire}
+        if (client._extract_status(user) or "") == "expired":
+            try:
+                limit = int(user.get("data_limit") or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            if limit == 0 or client._extract_usage(user) < limit:
+                payload["status"] = "active"
+
+        logger.info("Panel %s: renewing %s +%s days", panel_id, _sanitize_for_log(username), days)
+        await client._request("PUT", client._user_path(username), json=payload)
+
+        try:
+            fresh = await client.get_user(username)
+        except Exception:
+            fresh = None
+        view = to_client_view(client, fresh or {**user, "expire": new_expire}, panel_id)
+        if not fresh:
+            view["expires_at"] = new_expire
+        _idem_put(idem_key, view)
+        return view
+
+
+async def reset_usage(sub: Any) -> Dict[str, Any]:
+    """صفر کردن مصرف و فعال‌کردن سرویسِ limited."""
+    panel_id, username = _sub_ref(sub)
+    async with _lock_for(panel_id, username):
+        client, panel_id, username, user = await _load(sub)
+        logger.info("Panel %s: resetting usage of %s", panel_id, _sanitize_for_log(username))
+        await client._request(
+            "POST", USER_RESET_PATH_TEMPLATE.format(username=quote(username, safe=""))
+        )
+        if (client._extract_status(user) or "") == "limited":
+            await client._request("PUT", client._user_path(username), json={"status": "active"})
+        fresh = await client.get_user(username)
+        return to_client_view(client, fresh or user, panel_id)
+
+
+async def set_volume(sub: Any, volume_gb: float) -> Dict[str, Any]:
+    """تعیین سقف حجم (مقدار مطلق). 0 = نامحدود."""
+    try:
+        volume_gb = float(volume_gb)
+    except (TypeError, ValueError):
+        raise PasarGuardError("Invalid volume.", status=400)
+    if not math.isfinite(volume_gb) or volume_gb < 0 or volume_gb > MAX_VOLUME_GB:
+        raise PasarGuardError("Volume out of range.", status=400)
+    new_limit = int(volume_gb * BYTES_PER_GB)
+    if volume_gb > 0 and new_limit <= 0:
+        raise PasarGuardError("Volume too small.", status=400)
+
+    panel_id, username = _sub_ref(sub)
+    async with _lock_for(panel_id, username):
+        client, panel_id, username, user = await _load(sub)
+        payload: Dict[str, Any] = {"data_limit": new_limit}
+        if (client._extract_status(user) or "") == "limited":
+            if new_limit == 0 or new_limit > client._extract_usage(user):
+                payload["status"] = "active"
+        logger.info("Panel %s: set volume of %s to %s GB", panel_id, _sanitize_for_log(username), volume_gb)
+        await client._request("PUT", client._user_path(username), json=payload)
+        fresh = await client.get_user(username)
+        return to_client_view(client, fresh or {**user, "data_limit": new_limit}, panel_id)
+
+
+async def delete_subscription(sub: Any) -> bool:
+    """
+    حذف دائمی از پنل (پاسارگارد سطل بازیافت ندارد). نبودن کاربر (404) موفق حساب می‌شود.
+    فقط برای حذف توسط ادمین یا rollback خرید ناقص صدا بزن.
+    """
+    panel_id, username = _sub_ref(sub)
+    client = await panel_registry.get_client(panel_id)
+    try:
+        await client.delete_config(username=username)
+    except PasarGuardError as exc:
+        if getattr(exc, "status", None) == 404:
+            return True
+        raise
+    return True
 
 
 async def close_connection():
