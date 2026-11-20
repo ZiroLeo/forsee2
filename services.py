@@ -1,4 +1,6 @@
+import html
 import logging
+import math
 import re
 import time
 from typing import Optional
@@ -13,8 +15,21 @@ from database import (
     get_connection, get_subscription, get_subscription_by_config_name,
     update_subscription_volume, update_subscription_state,
     hard_delete_subscription, get_user, log_event,
+    get_subscription_product,
 )
-from paxiva import PaxivaClient, PaxivaError
+from dev.alerts import send_alert
+from pasar_guard import (
+    PanelRegistry,
+    PasarGuardCircuitOpen,
+    PasarGuardError,
+    get_live,
+    is_definite_rejection,
+    is_not_found,
+    renew_days,
+    reset_usage as panel_reset_usage,
+    set_volume as panel_set_volume,
+    delete_subscription as panel_delete_subscription,
+)
 from rich import premium_emoji
 from utils import validate_config_name, format_bytes, format_days_remaining
 
@@ -87,8 +102,53 @@ def fmt_date(ts) -> str:
 
 
 def bar(percent: float, length: int = 10) -> str:
-    filled = int((percent / 100) * length)
+    percent = max(0.0, min(100.0, float(percent)))
+    filled = max(0, min(length, int((percent / 100) * length)))
     return "█" * filled + "░" * (length - filled)
+
+
+def _safe_html(value) -> str:
+    """Escape dynamic values before inserting them into Telegram HTML."""
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def _panel_error_notice(error: BaseException) -> str:
+    """متن فارسی و امن برای خطای پنل (جزئیات فنی هرگز نمایش داده نمی‌شود)."""
+    if isinstance(error, PasarGuardCircuitOpen):
+        return "پنل موقتاً در دسترس نیست؛ کمی بعد دوباره تلاش کنید."
+    if is_not_found(error):
+        return "سرویس در پنل پیدا نشد."
+    if is_definite_rejection(error):
+        return "پنل درخواست را نپذیرفت."
+    return "نتیجهٔ عملیات در پنل نامشخص است؛ با «بروزرسانی» وضعیت را بررسی کنید."
+
+
+UNKNOWN_RESULT_NOTICE = "نتیجهٔ عملیات نامشخص است؛ با «بروزرسانی» وضعیت را بررسی کنید."
+
+
+def _report_panel_error(action: str, error: BaseException, admin_id: int, sub_id) -> None:
+    """هشدار دولوپر برای خطای عملیات ادمین روی پنل."""
+    try:
+        send_alert(
+            "WARNING" if isinstance(error, PasarGuardError) and is_definite_rejection(error) else "ERROR",
+            f"خطا در عملیات ادمین روی پنل ({action})",
+            exc=error,
+            user_id=admin_id,
+            sub_id=sub_id,
+            status=getattr(error, "status", None),
+        )
+    except Exception:
+        logger.exception("Could not send panel error alert.")
+
+
+def _callback_id(callback: CallbackQuery, prefix: str) -> Optional[int]:
+    try:
+        if not callback.data.startswith(prefix):
+            return None
+        value = int(callback.data[len(prefix):])
+        return value if value > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ============================================================
@@ -123,82 +183,133 @@ def find_subscription(query: str) -> Optional[dict]:
 # RENDER SERVICE DETAILS
 # ============================================================
 
-async def _live(paxiva: PaxivaClient, sub: dict) -> tuple[Optional[dict], bool]:
-    if not sub.get("paxiva_client_id"):
+async def _live(panel_registry: Optional[PanelRegistry], sub: dict) -> tuple[Optional[dict], bool]:
+    if not sub.get("panel_id") or not sub.get("config_name"):
         return None, False
     try:
-        return await paxiva.get_client(int(sub["paxiva_client_id"])), True
-    except PaxivaError as error:
-        logger.warning("panel lookup failed for sub %s: %s", sub["id"], getattr(error, "message", error))
+        return await get_live(sub), True
+    except PasarGuardError as error:
+        logger.warning("panel lookup failed for sub %s: status=%s", sub["id"], getattr(error, "status", None))
     except Exception:
         logger.exception("panel lookup crashed for sub %s", sub["id"])
     return None, False
 
 
-async def render_service(sub_id: int, paxiva: PaxivaClient):
-    sub = get_subscription(sub_id)
+async def render_service(sub_id: int, panel_registry: Optional[PanelRegistry] = None):
+    sub = get_subscription(int(sub_id))
     if not sub:
         return None
 
-    remote, is_live = await _live(paxiva, sub)
+    remote, is_live = await _live(panel_registry, sub)
     src = remote or {}
 
-    used = int(src.get("used_bytes") if src.get("used_bytes") is not None else (sub.get("used_bytes") or 0))
-    volume_gb = float(src.get("volume_gb") if src.get("volume_gb") is not None else (sub.get("volume_gb") or 0))
-    expires_at = src.get("expires_at") if remote is not None else sub.get("expires_at")
-    state_key = src.get("state") or sub.get("state") or "active"
+    used_raw = src.get("used_bytes")
+    used = max(0, int(used_raw if used_raw is not None else (sub.get("used_bytes") or 0)))
 
+    volume_raw = src.get("volume_gb")
+    volume_gb = float(volume_raw if volume_raw is not None else (sub.get("volume_gb") or 0))
+    volume_gb = max(0.0, volume_gb)
+
+    expires_at = src.get("expires_at") if remote is not None else sub.get("expires_at")
+    state_key = str(src.get("state") or sub.get("state") or "active").lower()
+
+    # Synchronize the latest panel values with the database.
     if remote is not None:
         try:
             update_subscription_state(sub["id"], state_key, expires_at, used)
+            if volume_raw is not None:
+                update_subscription_volume(sub["id"], volume_gb)
+            sub = get_subscription(sub["id"]) or sub
         except Exception:
-            logger.exception("sync failed for sub %s", sub["id"])
+            logger.exception("subscription sync failed for sub %s", sub["id"])
 
     if volume_gb > 0:
         total = int(volume_gb * GIB)
-        percent = min(100.0, used * 100 / total) if total else 0
+        remaining = max(0, total - used)
+        percent = min(100.0, used * 100 / total) if total else 0.0
         usage = (
             f"{bar(percent)} <b>{percent:.0f}%</b>\n"
-            f"مصرف: <b>{format_bytes(used)}</b> از <b>{volume_gb:g} گیگ</b>\n"
-            f"باقی‌مانده: <b>{format_bytes(max(0, total - used))}</b>"
+            f"مصرف: <b>{_safe_html(format_bytes(used))}</b> از <b>{volume_gb:g} گیگ</b>\n"
+            f"باقی‌مانده: <b>{_safe_html(format_bytes(remaining))}</b>"
         )
     else:
-        usage = f"مصرف: <b>{format_bytes(used)}</b> (حجم نامحدود)"
+        usage = f"مصرف: <b>{_safe_html(format_bytes(used))}</b> (حجم نامحدود)"
 
     owner = get_user(sub["telegram_id"]) or {}
-    owner_name = f"@{owner['username']}" if owner.get("username") else (owner.get("first_name") or "—")
-    kind_fa = "نامحدود" if sub.get("kind") == "unl" else "حجمی"
-    expiry = "بدون محدودیت زمانی" if not expires_at else f"{format_days_remaining(expires_at)} ({fmt_date(expires_at)})"
+    if owner.get("username"):
+        owner_name = "@" + _safe_html(owner["username"])
+    else:
+        owner_name = _safe_html(owner.get("first_name") or "—")
+
+    kind = str(sub.get("kind") or "vol").lower()
+    kind_fa = "نامحدود" if kind == "unl" else "حجمی"
+    expiry = (
+        "بدون محدودیت زمانی"
+        if not expires_at
+        else f"{_safe_html(format_days_remaining(expires_at))} ({fmt_date(expires_at)})"
+    )
     link = src.get("link") or sub.get("link")
-    live_note = "" if is_live else f"\n{premium_emoji('warning', '⚠️')} <i>اتصال به پنل برقرار نشد؛ اطلاعات از دیتابیس است.</i>"
+    live_note = "" if is_live else (
+        f"\n{premium_emoji('warning', '⚠️')} "
+        "<i>اتصال به پنل برقرار نشد؛ اطلاعات از دیتابیس نمایش داده می‌شود.</i>"
+    )
+
+    auto_renew = bool(sub.get("auto_renew"))
+    auto_renew_text = (
+        f"{premium_emoji('true', '✅')} روشن"
+        if auto_renew else f"{premium_emoji('light', '⏸')} خاموش"
+    )
+
+    product = None
+    try:
+        product = get_subscription_product(sub["id"])
+    except Exception:
+        logger.exception("could not load linked product for sub %s", sub["id"])
+
+    if product:
+        product_name = product.get("name") or product.get("title") or f"#{product['id']}"
+        product_text = (
+            f"محصول پایه: <b>{_safe_html(product_name)}</b> "
+            f"(قیمت فعلی: <b>{int(product.get('price_toman') or 0):,}</b> تومان)"
+        )
+    else:
+        product_text = "محصول پایه: <i>به این سرویس متصل نشده</i>"
 
     text = (
-        f"{premium_emoji('world', '🌍')} <b>سرویس</b> <code>{sub['config_name']}</code>\n"
+        f"{premium_emoji('world', '🌍')} <b>سرویس</b> <code>{_safe_html(sub.get('config_name'))}</code>\n"
         "━━━━━━━━━━━━━━\n"
-        f"{premium_emoji('telegram', '👤')} مالک: <code>{sub['telegram_id']}</code> ({owner_name})\n"
-        f"{premium_emoji('light', '📌')} وضعیت: <b>{STATE_FA.get(state_key, state_key)}</b>\n"
+        f"{premium_emoji('telegram', '👤')} مالک: <code>{int(sub['telegram_id'])}</code> ({owner_name})\n"
+        f"{premium_emoji('light', '📌')} وضعیت: <b>{_safe_html(STATE_FA.get(state_key, state_key))}</b>\n"
         f"{premium_emoji('shop', '🧩')} نوع: <b>{kind_fa}</b> | دستگاه: <b>{int(sub.get('devices') or 0)}</b>\n"
         f"{premium_emoji('light', '⏳')} انقضا: <b>{expiry}</b>\n"
+        f"تمدید خودکار: <b>{auto_renew_text}</b>\n"
+        f"{product_text}\n"
         "━━━━━━━━━━━━━━\n"
         f"{usage}\n"
         "━━━━━━━━━━━━━━\n"
-        f"{premium_emoji('wallet', '💰')} قیمت خرید: <b>{sub.get('price_toman') or 0:,}</b> تومان / <b>{sub.get('price_stars') or 0:,}</b> {premium_emoji('stars', '⭐')}\n"
+        f"{premium_emoji('wallet', '💰')} قیمت خرید: "
+        f"<b>{int(sub.get('price_toman') or 0):,}</b> تومان / "
+        f"<b>{int(sub.get('price_stars') or 0):,}</b> {premium_emoji('stars', '⭐')}\n"
         f"{premium_emoji('light', '📅')} ساخته‌شده: {fmt_date(sub.get('created_at'))}"
         f"{live_note}"
     )
     if link:
-        text += f"\n\n{premium_emoji('safe', '🔗')} <code>{link}</code>"
+        text += f"\n\n{premium_emoji('safe', '🔗')} <code>{_safe_html(link)}</code>"
 
-    markup = _keyboard([
+    rows = [
         [_button("بروزرسانی", f"admin:services:open:{sub_id}", "primary", "light")],
         [_button("پروفایل مالک", f"admin:users:view:{sub['telegram_id']}", "success", "telegram")],
-        [_button("افزودن روز", f"admin:services:days:{sub_id}", "primary", "blue_dot")],
+    ]
+    # Vol services have no time limit; only time-based (unl) services can be extended by days.
+    if kind == "unl":
+        rows.append([_button("افزودن روز", f"admin:services:days:{sub_id}", "primary", "blue_dot")])
+    rows.extend([
         [_button("ویرایش حجم", f"admin:services:volume:{sub_id}", "success", "safe")],
         [_button("ریست مصرف", f"admin:services:reset:{sub_id}", "primary", "dice")],
         [_button("حذف سرویس", f"admin:services:delask:{sub_id}", "danger", "warning")],
         [_button("بازگشت", "admin:services:menu", "danger", "back")],
     ])
-    return text, markup
+    return text, _keyboard(rows)
 
 
 @router.callback_query(F.data == "admin:services:menu")
@@ -219,7 +330,7 @@ async def services_menu(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(ServiceStates.waiting_query, F.text)
-async def query_received(message: Message, state: FSMContext, bot: Bot, paxiva: PaxivaClient):
+async def query_received(message: Message, state: FSMContext, bot: Bot, panel_registry: Optional[PanelRegistry] = None):
     sub = find_subscription(message.text)
     if not sub:
         try:
@@ -234,7 +345,7 @@ async def query_received(message: Message, state: FSMContext, bot: Bot, paxiva: 
         await _safe_answer(message, text, markup)
         return
     await state.clear()
-    view = await render_service(sub["id"], paxiva)
+    view = await render_service(sub["id"], panel_registry)
     try:
         await message.delete()
     except Exception:
@@ -244,13 +355,17 @@ async def query_received(message: Message, state: FSMContext, bot: Bot, paxiva: 
 
 
 @router.callback_query(F.data.startswith("admin:services:open:"))
-async def open_service(callback: CallbackQuery, state: FSMContext, paxiva: PaxivaClient):
+async def open_service(callback: CallbackQuery, state: FSMContext, panel_registry: Optional[PanelRegistry] = None):
     await state.clear()
-    await callback.answer()
-    view = await render_service(int(callback.data.split(":")[3]), paxiva)
+    sub_id = _callback_id(callback, "admin:services:open:")
+    if sub_id is None:
+        await callback.answer("شناسه سرویس نامعتبر است.", show_alert=True)
+        return
+    view = await render_service(sub_id, panel_registry)
     if not view:
         await callback.answer("سرویس یافت نشد.", show_alert=True)
         return
+    await callback.answer()
     await _safe_answer(callback.message, *view)
 
 
@@ -259,21 +374,28 @@ async def open_service(callback: CallbackQuery, state: FSMContext, paxiva: Paxiv
 # ============================================================
 
 @router.callback_query(F.data.startswith("admin:services:reset:"))
-async def reset_usage(callback: CallbackQuery, paxiva: PaxivaClient):
+async def reset_usage(callback: CallbackQuery, panel_registry: Optional[PanelRegistry] = None):
     sub_id = int(callback.data.split(":")[3])
     sub = get_subscription(sub_id)
-    if not sub or not sub.get("paxiva_client_id"):
+    if not sub or not sub.get("panel_id") or not sub.get("config_name"):
         await callback.answer("سرویس یافت نشد.", show_alert=True)
         return
     try:
-        await paxiva.reset_client_traffic(int(sub["paxiva_client_id"]))
+        await panel_reset_usage(sub)
         update_subscription_state(sub_id, sub.get("state") or "active", None, 0)
         log_event("INFO", "admin_reset_usage", callback.from_user.id, f"sub_id={sub_id}")
         await callback.answer("مصرف صفر شد.")
-    except PaxivaError as error:
-        await callback.answer(f"خطا در پنل: {error.message}", show_alert=True)
+    except PasarGuardError as error:
+        logger.warning("admin reset usage failed: sub_id=%s status=%s", sub_id, getattr(error, "status", None))
+        _report_panel_error("reset_usage", error, callback.from_user.id, sub_id)
+        await callback.answer(f"خطا در پنل: {_panel_error_notice(error)}", show_alert=True)
         return
-    view = await render_service(sub_id, paxiva)
+    except Exception as error:
+        logger.exception("admin reset usage crashed: sub_id=%s", sub_id)
+        _report_panel_error("reset_usage", error, callback.from_user.id, sub_id)
+        await callback.answer(f"خطا: {UNKNOWN_RESULT_NOTICE}", show_alert=True)
+        return
+    view = await render_service(sub_id, panel_registry)
     if view:
         await _safe_answer(callback.message, *view)
 
@@ -298,7 +420,7 @@ async def days_ask(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(ServiceStates.waiting_days, F.text)
-async def days_received(message: Message, state: FSMContext, bot: Bot, paxiva: PaxivaClient):
+async def days_received(message: Message, state: FSMContext, bot: Bot, panel_registry: Optional[PanelRegistry] = None):
     days = parse_int(message.text, 1, 3650)
     if days is None:
         try:
@@ -308,18 +430,32 @@ async def days_received(message: Message, state: FSMContext, bot: Bot, paxiva: P
         return
     data = await state.get_data()
     sub = get_subscription(data.get("sub_id"))
-    if not sub or not sub.get("paxiva_client_id"):
+    if not sub or not sub.get("panel_id") or not sub.get("config_name"):
         await state.clear()
         await _safe_answer(message, "❌ سرویس یافت نشد.", _keyboard([[_button("بازگشت", "admin:services:menu", "danger", "back")]]))
         return
+    if str(sub.get("kind") or "").lower() != "unl":
+        await state.clear()
+        await _safe_answer(message, "افزودن روز فقط برای سرویس‌های زمان‌دار (نامحدود) قابل انجام است.")
+        return
     try:
-        await paxiva.renew_volume_client(int(sub["paxiva_client_id"]), days, f"admin-days-{sub['id']}-{int(time.time())}")
+        await renew_days(
+            sub,
+            days,
+            f"admin-days-{sub['id']}-{int(time.time())}",
+        )
         log_event("INFO", "admin_add_days", message.from_user.id, f"sub_id={sub['id']}, days={days}")
         notice = f"{premium_emoji('true', '✅')} <b>{days} روز به سرویس اضافه شد.</b>\n\n"
-    except PaxivaError as error:
-        notice = f"{premium_emoji('false', '❌')} <b>خطا در پنل:</b> {error.message}\n\n"
+    except PasarGuardError as error:
+        logger.warning("admin add days failed: sub_id=%s status=%s", sub["id"], getattr(error, "status", None))
+        _report_panel_error("add_days", error, message.from_user.id, sub["id"])
+        notice = f"{premium_emoji('false', '❌')} <b>خطا در پنل:</b> {_panel_error_notice(error)}\n\n"
+    except Exception as error:
+        logger.exception("admin add days crashed: sub_id=%s", sub["id"])
+        _report_panel_error("add_days", error, message.from_user.id, sub["id"])
+        notice = f"{premium_emoji('false', '❌')} <b>خطا:</b> {UNKNOWN_RESULT_NOTICE}\n\n"
     await state.clear()
-    view = await render_service(sub["id"], paxiva)
+    view = await render_service(sub["id"], panel_registry)
     try:
         await message.delete()
     except Exception:
@@ -336,7 +472,7 @@ async def volume_ask(callback: CallbackQuery, state: FSMContext):
     text = (
         f"{premium_emoji('safe', '📦')} <b>ویرایش حجم</b>\n"
         "━━━━━━━━━━━━━━\n"
-        "حجم جدید را به گیگابایت بفرست (۰ تا ۱۰۰۰۰)."
+        "حجم جدید را به گیگابایت بفرست (۰ تا ۱۰۰۰۰). مقدار صفر فقط برای سرویس نامحدود مجاز است."
     )
     markup = _keyboard([[_button("انصراف", f"admin:services:open:{sub_id}", "danger", "back")]])
     await _safe_answer(callback.message, text, markup)
@@ -344,10 +480,10 @@ async def volume_ask(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(ServiceStates.waiting_volume, F.text)
-async def volume_received(message: Message, state: FSMContext, bot: Bot, paxiva: PaxivaClient):
+async def volume_received(message: Message, state: FSMContext, bot: Bot, panel_registry: Optional[PanelRegistry] = None):
     try:
         volume = float(message.text.strip().replace(",", "."))
-        if volume < 0 or volume > 10000:
+        if not math.isfinite(volume) or volume < 0 or volume > 10000:
             raise ValueError
     except (ValueError, AttributeError):
         try:
@@ -357,19 +493,28 @@ async def volume_received(message: Message, state: FSMContext, bot: Bot, paxiva:
         return
     data = await state.get_data()
     sub = get_subscription(data.get("sub_id"))
-    if not sub or not sub.get("paxiva_client_id"):
+    if not sub or not sub.get("panel_id") or not sub.get("config_name"):
         await state.clear()
         await _safe_answer(message, "❌ سرویس یافت نشد.", _keyboard([[_button("بازگشت", "admin:services:menu", "danger", "back")]]))
         return
+    if str(sub.get("kind") or "").lower() == "vol" and volume <= 0:
+        await _safe_answer(message, "❌ سرویس حجمی باید حجم بیشتر از صفر داشته باشد.")
+        return
     try:
-        await paxiva.update_client_volume(int(sub["paxiva_client_id"]), volume)
+        await panel_set_volume(sub, volume)
         update_subscription_volume(sub["id"], volume)
         log_event("INFO", "admin_edit_volume", message.from_user.id, f"sub_id={sub['id']}, new_vol={volume}")
         notice = f"{premium_emoji('true', '✅')} <b>حجم سرویس به {volume:g} گیگ تغییر کرد.</b>\n\n"
-    except PaxivaError as error:
-        notice = f"{premium_emoji('false', '❌')} <b>خطا در پنل:</b> {error.message}\n\n"
+    except PasarGuardError as error:
+        logger.warning("admin edit volume failed: sub_id=%s status=%s", sub["id"], getattr(error, "status", None))
+        _report_panel_error("edit_volume", error, message.from_user.id, sub["id"])
+        notice = f"{premium_emoji('false', '❌')} <b>خطا در پنل:</b> {_panel_error_notice(error)}\n\n"
+    except Exception as error:
+        logger.exception("admin edit volume crashed: sub_id=%s", sub["id"])
+        _report_panel_error("edit_volume", error, message.from_user.id, sub["id"])
+        notice = f"{premium_emoji('false', '❌')} <b>خطا:</b> {UNKNOWN_RESULT_NOTICE}\n\n"
     await state.clear()
-    view = await render_service(sub["id"], paxiva)
+    view = await render_service(sub["id"], panel_registry)
     try:
         await message.delete()
     except Exception:
@@ -390,7 +535,7 @@ async def delete_ask(callback: CallbackQuery):
         await callback.answer("سرویس یافت نشد.", show_alert=True)
         return
     text = (
-        f"{premium_emoji('warning', '⚠️')} <b>سرویس <code>{sub['config_name']}</code> حذف شود؟</b>\n"
+        f"{premium_emoji('warning', '⚠️')} <b>سرویس <code>{_safe_html(sub['config_name'])}</code> حذف شود؟</b>\n"
         "━━━━━━━━━━━━━━\n"
         "سرویس از پنل و دیتابیس پاک می‌شود و قابل بازگشت نیست."
     )
@@ -403,23 +548,36 @@ async def delete_ask(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("admin:services:delete:"))
-async def delete_service(callback: CallbackQuery, paxiva: PaxivaClient):
+async def delete_service(callback: CallbackQuery, panel_registry: Optional[PanelRegistry] = None):
     sub_id = int(callback.data.split(":")[3])
     sub = get_subscription(sub_id)
     if not sub:
         await callback.answer("سرویس یافت نشد.", show_alert=True)
         return
+    had_panel = bool(sub.get("panel_id"))
     try:
-        if sub.get("paxiva_client_id"):
-            await paxiva.delete_client(int(sub["paxiva_client_id"]), purge=True)
-    except PaxivaError as error:
-        if getattr(error, "status_code", None) != 404:
-            text = f"{premium_emoji('false', '❌')} <b>حذف از پنل ناموفق بود:</b> {error.message}\nسرویس در دیتابیس باقی ماند."
-            markup = _keyboard([[_button("بازگشت", f"admin:services:open:{sub_id}", "danger", "back")]])
-            await _safe_answer(callback.message, text, markup)
-            return
+        if had_panel:
+            # نبودن کاربر در پنل (404) داخل delete_subscription موفق حساب می‌شود.
+            await panel_delete_subscription(sub)
+    except Exception as error:
+        if isinstance(error, PasarGuardError):
+            logger.warning("admin delete failed: sub_id=%s status=%s", sub_id, getattr(error, "status", None))
+            reason = _panel_error_notice(error)
+        else:
+            logger.exception("admin delete crashed: sub_id=%s", sub_id)
+            reason = UNKNOWN_RESULT_NOTICE
+        _report_panel_error("delete", error, callback.from_user.id, sub_id)
+        text = f"{premium_emoji('false', '❌')} <b>حذف از پنل ناموفق بود:</b> {reason}\nسرویس در دیتابیس باقی ماند."
+        markup = _keyboard([[_button("بازگشت", f"admin:services:open:{sub_id}", "danger", "back")]])
+        await _safe_answer(callback.message, text, markup)
+        return
     hard_delete_subscription(sub_id)
     log_event("INFO", "admin_service_deleted", callback.from_user.id, f"sub_id={sub_id}; name={sub['config_name']}")
-    text = f"{premium_emoji('true', '✅')} <b>سرویس <code>{sub['config_name']}</code> حذف شد.</b>"
+    text = f"{premium_emoji('true', '✅')} <b>سرویس <code>{_safe_html(sub['config_name'])}</code> حذف شد.</b>"
+    if not had_panel:
+        text += (
+            f"\n{premium_emoji('warning', '⚠️')} <i>این سرویس به پنل متصل نبود "
+            "(panel_id ندارد)؛ فقط از دیتابیس حذف شد. در صورت وجود در پنل، دستی حذفش کنید.</i>"
+        )
     markup = _keyboard([[_button("جستجوی سرویس دیگر", "admin:services:menu", "success", "world")]])
     await _safe_answer(callback.message, text, markup)
