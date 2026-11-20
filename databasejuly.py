@@ -410,7 +410,39 @@ def init_database() -> None:
         """)
 
         _ensure_column(conn, "products", "panel_id", "INTEGER REFERENCES panels(id) ON DELETE SET NULL")
+        # Product identity and renewal state are additive migrations.
+        _ensure_column(conn, "subscriptions", "product_id", "INTEGER REFERENCES products(id) ON DELETE SET NULL")
+        _ensure_column(conn, "subscriptions", "auto_renew_last_attempt_at", "INTEGER")
+        _ensure_column(conn, "subscriptions", "auto_renew_last_success_at", "INTEGER")
+        _ensure_column(conn, "subscriptions", "auto_renew_last_error", "TEXT")
+        _ensure_column(conn, "stars_invoices", "kind", "TEXT NOT NULL DEFAULT 'vol'")
         _ensure_column(conn, "subscriptions", "panel_id", "INTEGER REFERENCES panels(id) ON DELETE SET NULL")
+        # اتصال سرویس‌های قدیمی به محصول فقط وقتی انجام می‌شود که تطبیق یکتا باشد.
+        # برای محصولات حجمی ستون days در نسخه‌های قدیمی ممکن است 30 باشد؛ در تطبیق نادیده گرفته می‌شود.
+        conn.execute("""
+            UPDATE subscriptions AS s
+            SET product_id = (
+                SELECT MIN(p.id)
+                FROM products AS p
+                WHERE p.is_active = 1
+                  AND p.kind = s.kind
+                  AND p.volume_gb = s.volume_gb
+                  AND (s.kind = 'vol' OR p.days = s.days)
+                  AND p.price_toman = s.price_toman
+                  AND (s.panel_id IS NULL OR p.panel_id = s.panel_id)
+            )
+            WHERE s.product_id IS NULL
+              AND 1 = (
+                SELECT COUNT(*)
+                FROM products AS p
+                WHERE p.is_active = 1
+                  AND p.kind = s.kind
+                  AND p.volume_gb = s.volume_gb
+                  AND (s.kind = 'vol' OR p.days = s.days)
+                  AND p.price_toman = s.price_toman
+                  AND (s.panel_id IS NULL OR p.panel_id = s.panel_id)
+              )
+        """)
         _ensure_column(conn, "stars_invoices", "panel_id", "INTEGER REFERENCES panels(id) ON DELETE SET NULL")
         _ensure_column(conn, "stars_charges", "panel_id", "INTEGER REFERENCES panels(id) ON DELETE SET NULL")
         _ensure_column(conn, "users", "points", "INTEGER NOT NULL DEFAULT 0")
@@ -421,6 +453,47 @@ def init_database() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_panel ON subscriptions(panel_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_stars_invoice_panel ON stars_invoices(panel_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_stars_charge_panel ON stars_charges(panel_id)")
+
+        # تمدیدها: ثبت سفارش، پرداخت اتمیک و جلوگیری از تمدید هم‌زمان تکراری
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS renewal_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT UNIQUE,
+                subscription_id INTEGER NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                panel_id INTEGER,
+                source TEXT NOT NULL CHECK (source IN ('manual', 'auto')),
+                trigger_reason TEXT,
+                kind TEXT NOT NULL CHECK (kind IN ('vol', 'unl')),
+                volume_gb REAL NOT NULL DEFAULT 0,
+                days INTEGER NOT NULL DEFAULT 0,
+                price_toman INTEGER NOT NULL CHECK (price_toman >= 0),
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'processing', 'delivered', 'failed', 'refunded')),
+                wallet_transaction_id INTEGER,
+                external_reference TEXT,
+                last_error TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                delivered_at INTEGER,
+                refunded_at INTEGER,
+                FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE RESTRICT,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE RESTRICT,
+                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT,
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE SET NULL,
+                FOREIGN KEY (wallet_transaction_id) REFERENCES wallet_transactions(id) ON DELETE SET NULL
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_renewal_active_subscription
+            ON renewal_orders(subscription_id)
+            WHERE status IN ('pending', 'processing')
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_renewal_status_created ON renewal_orders(status, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_auto_renew ON subscriptions(auto_renew, state, kind)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_product ON subscriptions(product_id)")
 
         # ========================================================
         # امتیازها، گروه‌ها، کلیدواژه‌ها و مأموریت‌های پویا
@@ -1095,7 +1168,7 @@ def create_stars_invoice(
         or volume_gb < 0
         or volume_gb > 1000
         or not 0 <= days <= 3650
-        or not 1 <= devices <= 10
+        or not 0 <= devices <= 10
         or price_toman < 0
         or not 0 <= discount_percent <= 100
         or discount_amount_toman < 0
@@ -1128,8 +1201,9 @@ def create_stars_invoice(
 
                 if (
                     not product
-                    or product["kind"] != "vol"
+                    or product["kind"] not in ("vol", "unl")
                     or float(product["volume_gb"]) != volume_gb
+                    or (product["kind"] == "unl" and int(product["days"]) != days)
                 ):
                     conn.rollback()
                     return None
@@ -1139,6 +1213,7 @@ def create_stars_invoice(
                 INSERT INTO stars_invoices (
                     payload,
                     telegram_id,
+                    kind,
                     volume_gb,
                     days,
                     devices,
@@ -1158,7 +1233,7 @@ def create_stars_invoice(
                     panel_id
                 )
                 VALUES (
-                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?,
                     'pending', 'pending',
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
@@ -1166,6 +1241,7 @@ def create_stars_invoice(
                 (
                     payload,
                     telegram_id,
+                    (product["kind"] if product_id is not None else "vol"),
                     volume_gb,
                     days,
                     devices,
@@ -1468,18 +1544,22 @@ def create_subscription(
     volume_gb: float, days: int, devices: int,
     price_toman: int, price_stars: int,
     is_trial: int = 0, paxiva_client_id: Optional[int] = None, link: Optional[str] = None,
-    panel_id: Optional[int] = None
+    panel_id: Optional[int] = None, product_id: Optional[int] = None
 ) -> Optional[int]:
     telegram_id = validate_telegram_id(telegram_id)
+    kind = str(kind).lower().strip()
+    if kind not in ("vol", "unl"):
+        raise ValueError("Invalid subscription kind")
+    days = 0 if kind == "vol" else max(1, int(days or 30))
     with get_connection() as conn:
         try:
             cursor = conn.execute(
                 """INSERT INTO subscriptions 
                 (telegram_id, config_number, config_name, kind, volume_gb, days, devices,
-                 price_toman, price_stars, is_trial, paxiva_client_id, panel_id, link, state, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                 price_toman, price_stars, is_trial, paxiva_client_id, panel_id, product_id, link, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
                 (telegram_id, config_number, config_name, kind, volume_gb, days, devices,
-                 price_toman, price_stars, is_trial, paxiva_client_id, panel_id, link, now_ts(), now_ts())
+                 price_toman, price_stars, is_trial, paxiva_client_id, panel_id, product_id, link, now_ts(), now_ts())
             )
             conn.commit()
             return cursor.lastrowid
@@ -1491,22 +1571,47 @@ def finalize_purchase(
     telegram_id: int, config_number: int, config_name: str, kind: str,
     volume_gb: float, days: int, devices: int, price_toman: int,
     paxiva_client_id: int, link: str, discount_id: Optional[int] = None,
-    panel_id: Optional[int] = None,
+    panel_id: Optional[int] = None, product_id: Optional[int] = None,
 ) -> int:
     """FLOW-02: ثبت اشتراک + مصرف کد تخفیف + شمارش خرید + پورسانت رفرال در «یک» تراکنش.
     یا همه انجام می‌شود یا هیچ‌کدام. در صورت ناموجود بودن کد تخفیف ValueError می‌دهد.
     شناسهٔ اشتراک را برمی‌گرداند."""
     telegram_id = validate_telegram_id(telegram_id)
+    kind = str(kind).lower().strip()
+    if kind not in ("vol", "unl"):
+        raise ValueError("Invalid subscription kind")
+    days = 0 if kind == "vol" else max(1, int(days or 30))
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            resolved_product_id = int(product_id) if product_id is not None else None
+            if resolved_product_id is None:
+                matches = conn.execute(
+                    """SELECT id FROM products
+                       WHERE is_active = 1 AND kind = ? AND volume_gb = ?
+                         AND (? = 'vol' OR days = ?)
+                         AND price_toman = ? AND (? IS NULL OR panel_id = ?)
+                       ORDER BY id DESC LIMIT 2""",
+                    (kind, float(volume_gb), kind, days, int(price_toman), panel_id, panel_id),
+                ).fetchall()
+                if len(matches) == 1:
+                    resolved_product_id = int(matches[0]["id"])
+            if resolved_product_id is not None:
+                product_row = conn.execute(
+                    "SELECT id, kind, panel_id FROM products WHERE id = ?",
+                    (resolved_product_id,),
+                ).fetchone()
+                if not product_row or product_row["kind"] != kind:
+                    raise ValueError("product_mismatch")
+                if panel_id is not None and product_row["panel_id"] != panel_id:
+                    raise ValueError("product_panel_mismatch")
             cursor = conn.execute(
                 """INSERT INTO subscriptions
                 (telegram_id, config_number, config_name, kind, volume_gb, days, devices,
-                 price_toman, price_stars, is_trial, paxiva_client_id, panel_id, link, state, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'active', ?, ?)""",
+                 price_toman, price_stars, is_trial, paxiva_client_id, panel_id, product_id, link, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, 'active', ?, ?)""",
                 (telegram_id, config_number, config_name, kind, volume_gb, days, devices,
-                 price_toman, paxiva_client_id, panel_id, link, now_ts(), now_ts())
+                 price_toman, paxiva_client_id, panel_id, resolved_product_id, link, now_ts(), now_ts())
             )
             sub_id = int(cursor.lastrowid)
             if discount_id is not None:
@@ -1588,7 +1693,7 @@ def finalize_stars_purchase(
         or not link
         or config_number <= 0
         or volume_gb < 0
-        or not 1 <= devices <= 10
+        or not 0 <= devices <= 10
         or not 0 <= days <= 3650
         or price_toman < 0
         or paxiva_client_id <= 0
@@ -1765,27 +1870,30 @@ def finalize_stars_purchase(
                     is_trial,
                     paxiva_client_id,
                     panel_id,
+                    product_id,
                     link,
                     state,
                     created_at,
                     updated_at
                 )
                 VALUES (
-                    ?, ?, ?, 'vol', ?, ?, ?, ?, ?,
-                    0, ?, ?, ?, 'active', ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    0, ?, ?, ?, ?, 'active', ?, ?
                 )
                 """,
                 (
                     telegram_id,
                     config_number,
                     config_name,
+                    (invoice["kind"] or "vol"),
                     volume_gb,
-                    days,
+                    (0 if (invoice["kind"] or "vol") == "vol" else days),
                     devices,
                     price_toman,
                     price_stars,
                     paxiva_client_id,
                     invoice["panel_id"],
+                    invoice["product_id"],
                     link,
                     timestamp,
                     timestamp,
@@ -1950,12 +2058,70 @@ def update_subscription_volume(subscription_id: int, new_volume: float) -> bool:
         return cursor.rowcount > 0
 
 def toggle_auto_renew(subscription_id: int, enabled: bool) -> bool:
+    subscription_id = int(subscription_id)
+    timestamp = now_ts()
     with get_connection() as conn:
-        cursor = conn.execute(
-            "UPDATE subscriptions SET auto_renew = ?, updated_at = ? WHERE id = ?",
-            (1 if enabled else 0, now_ts(), subscription_id)
-        )
-        return cursor.rowcount > 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sub = conn.execute(
+                "SELECT product_id, is_trial, state FROM subscriptions WHERE id = ?",
+                (subscription_id,),
+            ).fetchone()
+            if not sub:
+                conn.rollback()
+                return False
+            if enabled:
+                if int(sub["is_trial"] or 0) or sub["state"] != "active" or not sub["product_id"]:
+                    conn.rollback()
+                    return False
+                product = conn.execute(
+                    "SELECT id FROM products WHERE id = ? AND is_active = 1",
+                    (int(sub["product_id"]),),
+                ).fetchone()
+                if not product:
+                    conn.rollback()
+                    return False
+            cursor = conn.execute(
+                "UPDATE subscriptions SET auto_renew = ?, updated_at = ? WHERE id = ?",
+                (1 if enabled else 0, timestamp, subscription_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def set_subscription_product(subscription_id: int, product_id: int) -> bool:
+    """اتصال دستی سرویس قدیمی به محصول اصلی پس از اطمینان از نوع و پنل."""
+    subscription_id = int(subscription_id)
+    product_id = int(product_id)
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sub = conn.execute(
+                "SELECT kind, panel_id FROM subscriptions WHERE id = ?",
+                (subscription_id,),
+            ).fetchone()
+            product = conn.execute(
+                "SELECT kind, panel_id FROM products WHERE id = ? AND is_active = 1",
+                (product_id,),
+            ).fetchone()
+            if not sub or not product or sub["kind"] != product["kind"]:
+                conn.rollback()
+                return False
+            if sub["panel_id"] is not None and sub["panel_id"] != product["panel_id"]:
+                conn.rollback()
+                return False
+            cursor = conn.execute(
+                "UPDATE subscriptions SET product_id = ?, updated_at = ? WHERE id = ?",
+                (product_id, now_ts(), subscription_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            conn.rollback()
+            raise
 
 def delete_subscription_from_list(subscription_id: int) -> bool:
     with get_connection() as conn:
@@ -2215,7 +2381,21 @@ def is_banned(telegram_id: int) -> bool:
 # ============================================================
 
 def create_product(kind: str, volume_gb: float, days: int, price_toman: int, price_stars: int, panel_id: Optional[int] = None) -> Optional[int]:
+    kind = str(kind).strip().lower()
+    volume_gb = float(volume_gb)
+    price_toman = int(price_toman)
+    price_stars = int(price_stars)
+    if kind not in ("vol", "unl") or volume_gb < 0 or price_toman < 0 or price_stars < 0:
+        raise ValueError("Invalid product data")
+    if panel_id is None:
+        raise ValueError("panel_id_required")
+    # حجمی تاریخ انقضا ندارد؛ نامحدود یک‌ماهه است.
+    days = 0 if kind == "vol" else 30
+    panel_id = _validate_panel_id(panel_id)
     with get_connection() as conn:
+        panel = conn.execute("SELECT id FROM panels WHERE id = ? AND is_active = 1", (panel_id,)).fetchone()
+        if not panel:
+            raise ValueError("Panel not found or inactive")
         cursor = conn.execute(
             "INSERT INTO products (kind, volume_gb, days, price_toman, price_stars, panel_id, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
             (kind, volume_gb, days, price_toman, price_stars, panel_id, now_ts())
@@ -3683,9 +3863,13 @@ def finalize_points_purchase(
     if (
         not config_name or not link or kind not in ("vol", "unl")
         or config_number <= 0 or volume_gb < 0 or days < 0
-        or not 1 <= devices <= 10
+        or not 0 <= devices <= 10
     ):
         raise ValueError("Invalid points purchase data")
+    if kind == "vol":
+        days = 0
+    else:
+        days = max(1, days or 30)
 
     timestamp = now_ts()
     reference = f"points-purchase:{config_name}"
@@ -3762,5 +3946,472 @@ def get_pending_task_submissions(limit: int = 100) -> List[Dict[str, Any]]:
                ORDER BY ut.submitted_at ASC
                LIMIT ?""",
             (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+
+# ============================================================
+# تمدید سرویس‌ها — تمدید همان محصول با قیمت روز
+# ============================================================
+
+_GB_BYTES = 1024 ** 3
+_AUTO_RENEW_VOLUME_THRESHOLD_GB = 0.2
+_AUTO_RENEW_EXPIRY_WINDOW_SECONDS = 3 * 24 * 60 * 60
+
+
+def get_auto_renew_candidates(now: Optional[int] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    سرویس‌های آماده تمدید خودکار:
+    - حجمی: حجم باقی‌مانده <= 0.2GB (بدون بررسی تاریخ انقضا)
+    - نامحدود: حداکثر سه روز تا انقضا (یا منقضی‌شده)
+    محصول اصلی هر سرویس با قیمت فعلی از جدول products خوانده می‌شود.
+    """
+    timestamp = int(now if now is not None else now_ts())
+    limit = max(1, min(int(limit), 500))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.*,
+                   p.price_toman AS current_price_toman,
+                   p.price_stars AS current_price_stars,
+                   p.volume_gb AS product_volume_gb,
+                   p.days AS product_days,
+                   p.kind AS product_kind,
+                   p.panel_id AS product_panel_id
+            FROM subscriptions s
+            JOIN products p ON p.id = s.product_id AND p.is_active = 1
+            WHERE s.auto_renew = 1
+              AND s.state = 'active'
+              AND s.is_trial = 0
+              AND (
+                    s.auto_renew_last_error IS NULL
+                 OR s.auto_renew_last_attempt_at IS NULL
+                 OR s.auto_renew_last_attempt_at <= ?
+              )
+              AND (
+                    (s.kind = 'vol'
+                     AND ((s.volume_gb * ?) - s.used_bytes) < ?)
+                 OR (s.kind = 'unl'
+                     AND s.expires_at IS NOT NULL
+                     AND s.expires_at <= ?)
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM renewal_orders ro
+                    WHERE ro.subscription_id = s.id
+                      AND ro.status IN ('pending', 'processing')
+              )
+            ORDER BY s.id ASC
+            LIMIT ?
+            """,
+            (
+                timestamp - (6 * 60 * 60),
+                _GB_BYTES,
+                _AUTO_RENEW_VOLUME_THRESHOLD_GB * _GB_BYTES,
+                timestamp + _AUTO_RENEW_EXPIRY_WINDOW_SECONDS,
+                limit,
+            ),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_subscription_product(subscription_id: int) -> Optional[Dict[str, Any]]:
+    """محصول اصلی متصل به سرویس، همراه قیمت فعلی."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT p.*
+            FROM subscriptions s
+            JOIN products p ON p.id = s.product_id
+            WHERE s.id = ?
+            """,
+            (int(subscription_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_renewal_order(
+    subscription_id: int,
+    source: str = "manual",
+    trigger_reason: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    سفارش تمدید و کسر وجه کیف پول را اتمیک انجام می‌دهد.
+    قیمت از products در لحظهٔ تمدید خوانده می‌شود.
+    اگر موجودی کافی نباشد، وجهی کسر نمی‌شود و status='insufficient_funds' برمی‌گردد.
+    """
+    subscription_id = int(subscription_id)
+    source = str(source).strip().lower()
+    if source not in ("manual", "auto"):
+        raise ValueError("invalid_renewal_source")
+    trigger_reason = sanitize_text(trigger_reason, 100)
+    idempotency_key = sanitize_text(idempotency_key, 200) if idempotency_key else None
+    timestamp = now_ts()
+
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if idempotency_key:
+                old = conn.execute(
+                    "SELECT * FROM renewal_orders WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if old:
+                    conn.commit()
+                    return dict(old)
+
+            existing_active = conn.execute(
+                """SELECT * FROM renewal_orders
+                   WHERE subscription_id = ? AND status IN ('pending', 'processing')
+                   ORDER BY id DESC LIMIT 1""",
+                (subscription_id,),
+            ).fetchone()
+            if existing_active:
+                conn.commit()
+                return dict(existing_active)
+
+            sub = conn.execute(
+                "SELECT * FROM subscriptions WHERE id = ?",
+                (subscription_id,),
+            ).fetchone()
+            if not sub:
+                raise ValueError("subscription_not_found")
+            if sub["state"] not in ("active", "expired") or int(sub["is_trial"] or 0):
+                raise ValueError("subscription_not_renewable")
+            if source == "auto" and sub["state"] != "active":
+                raise ValueError("auto_renew_subscription_not_active")
+            if int(sub["telegram_id"]) <= 0:
+                raise ValueError("invalid_subscription_owner")
+            if not sub["product_id"]:
+                raise ValueError("subscription_product_not_linked")
+
+            product = conn.execute(
+                """SELECT * FROM products
+                   WHERE id = ? AND is_active = 1""",
+                (int(sub["product_id"]),),
+            ).fetchone()
+            if not product:
+                raise ValueError("renewal_product_unavailable")
+            if product["kind"] != sub["kind"]:
+                raise ValueError("renewal_product_kind_mismatch")
+            if sub["panel_id"] is not None and product["panel_id"] != sub["panel_id"]:
+                raise ValueError("renewal_product_panel_mismatch")
+
+            if source == "auto":
+                if not int(sub["auto_renew"] or 0):
+                    raise ValueError("auto_renew_disabled")
+                if sub["kind"] == "vol":
+                    remaining_bytes = (float(sub["volume_gb"]) * _GB_BYTES) - int(sub["used_bytes"] or 0)
+                    if remaining_bytes >= (_AUTO_RENEW_VOLUME_THRESHOLD_GB * _GB_BYTES):
+                        raise ValueError("auto_renew_not_due")
+                elif sub["kind"] == "unl":
+                    if not sub["expires_at"] or int(sub["expires_at"]) > timestamp + _AUTO_RENEW_EXPIRY_WINDOW_SECONDS:
+                        raise ValueError("auto_renew_not_due")
+
+            price = int(product["price_toman"])
+            if price <= 0:
+                raise ValueError("invalid_renewal_price")
+
+            user = conn.execute(
+                "SELECT balance FROM users WHERE telegram_id = ?",
+                (int(sub["telegram_id"]),),
+            ).fetchone()
+            if not user:
+                raise ValueError("renewal_user_not_found")
+            balance_before = int(user["balance"])
+            if balance_before < price:
+                conn.execute(
+                    """UPDATE subscriptions
+                       SET auto_renew_last_attempt_at = ?,
+                           auto_renew_last_error = 'insufficient_funds',
+                           updated_at = ?
+                       WHERE id = ?""",
+                    (timestamp, timestamp, subscription_id),
+                )
+                conn.commit()
+                return {
+                    "id": None,
+                    "subscription_id": subscription_id,
+                    "telegram_id": int(sub["telegram_id"]),
+                    "status": "insufficient_funds",
+                    "price_toman": price,
+                    "balance": balance_before,
+                }
+
+            # سفارش ابتدا ایجاد می‌شود تا شناسه یکتای آن مرجع تراکنش کیف پول باشد.
+            cursor = conn.execute(
+                """
+                INSERT INTO renewal_orders (
+                    idempotency_key, subscription_id, telegram_id, product_id,
+                    panel_id, source, trigger_reason, kind, volume_gb, days,
+                    price_toman, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    idempotency_key, subscription_id, int(sub["telegram_id"]),
+                    int(product["id"]), product["panel_id"], source, trigger_reason,
+                    product["kind"], float(product["volume_gb"]), int(product["days"]),
+                    price, timestamp, timestamp,
+                ),
+            )
+            order_id = int(cursor.lastrowid)
+            balance_after = balance_before - price
+            conn.execute(
+                "UPDATE users SET balance = ? WHERE telegram_id = ?",
+                (balance_after, int(sub["telegram_id"])),
+            )
+            wallet_cursor = conn.execute(
+                """
+                INSERT INTO wallet_transactions (
+                    telegram_id, amount, balance_before, balance_after,
+                    type, description, reference_id, created_at
+                )
+                VALUES (?, ?, ?, ?, 'renewal', ?, ?, ?)
+                """,
+                (
+                    int(sub["telegram_id"]), -price, balance_before, balance_after,
+                    f"تمدید سرویس {sub['config_name']}",
+                    f"renewal:{order_id}", timestamp,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE renewal_orders
+                SET wallet_transaction_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (int(wallet_cursor.lastrowid), timestamp, order_id),
+            )
+            conn.execute(
+                """
+                UPDATE subscriptions
+                SET auto_renew_last_attempt_at = ?,
+                    auto_renew_last_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, subscription_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM renewal_orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+            conn.commit()
+            return dict(row)
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def mark_renewal_processing(order_id: int) -> bool:
+    """قفل منطقی سفارش پیش از فراخوانی API پنل."""
+    timestamp = now_ts()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE renewal_orders
+            SET status = 'processing', attempts = attempts + 1, updated_at = ?
+            WHERE id = ? AND status IN ('pending', 'processing')
+            """,
+            (timestamp, int(order_id)),
+        )
+        return cursor.rowcount > 0
+
+
+def complete_renewal_order(
+    order_id: int,
+    external_reference: Optional[str] = None,
+) -> bool:
+    """
+    پس از موفقیت API پنل فراخوانی شود.
+    حجمی: سقف حجم خریداری‌شده به سقف قبلی اضافه می‌شود.
+    نامحدود: اعتبار به‌صورت ۳۰ روز از max(انقضای فعلی، اکنون) تمدید می‌شود.
+    """
+    order_id = int(order_id)
+    external_reference = sanitize_text(external_reference, 200)
+    timestamp = now_ts()
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            order = conn.execute(
+                "SELECT * FROM renewal_orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+            if not order:
+                raise ValueError("renewal_order_not_found")
+            if order["status"] == "delivered":
+                conn.commit()
+                return True
+            if order["status"] not in ("pending", "processing"):
+                raise ValueError("renewal_order_not_payable")
+
+            sub = conn.execute(
+                "SELECT * FROM subscriptions WHERE id = ?",
+                (int(order["subscription_id"]),),
+            ).fetchone()
+            if not sub:
+                raise ValueError("renewal_subscription_not_found")
+
+            if order["kind"] == "vol":
+                new_volume = float(sub["volume_gb"]) + float(order["volume_gb"])
+                conn.execute(
+                    """UPDATE subscriptions
+                       SET volume_gb = ?, price_toman = ?, product_id = ?,
+                           auto_renew_last_success_at = ?,
+                           auto_renew_last_error = NULL, updated_at = ?
+                       WHERE id = ?""",
+                    (
+                        new_volume, int(order["price_toman"]), int(order["product_id"]),
+                        timestamp, timestamp, int(order["subscription_id"]),
+                    ),
+                )
+            else:
+                current_expiry = int(sub["expires_at"] or 0)
+                base_expiry = max(current_expiry, timestamp)
+                extension_days = max(1, int(order["days"] or 30))
+                new_expiry = base_expiry + extension_days * 24 * 60 * 60
+                conn.execute(
+                    """UPDATE subscriptions
+                       SET expires_at = ?, days = ?, price_toman = ?, product_id = ?,
+                           auto_renew_last_success_at = ?,
+                           auto_renew_last_error = NULL, updated_at = ?
+                       WHERE id = ?""",
+                    (
+                        new_expiry, extension_days, int(order["price_toman"]),
+                        int(order["product_id"]), timestamp, timestamp,
+                        int(order["subscription_id"]),
+                    ),
+                )
+
+            conn.execute(
+                """
+                UPDATE renewal_orders
+                SET status = 'delivered', external_reference = ?,
+                    delivered_at = ?, updated_at = ?, last_error = NULL
+                WHERE id = ?
+                """,
+                (external_reference, timestamp, timestamp, order_id),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def fail_renewal_order(
+    order_id: int,
+    error: Optional[str] = None,
+    refund: bool = True,
+) -> bool:
+    """ثبت شکست تمدید؛ در صورت نیاز بازگشت وجه به‌صورت اتمیک و idempotent."""
+    order_id = int(order_id)
+    error = sanitize_text(error, 1000) or "renewal_failed"
+    timestamp = now_ts()
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            order = conn.execute(
+                "SELECT * FROM renewal_orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+            if not order:
+                return False
+            if order["status"] in ("delivered", "refunded"):
+                conn.rollback()
+                return False
+            if order["status"] == "failed":
+                conn.commit()
+                return True
+
+            final_status = "failed"
+            if refund:
+                user = conn.execute(
+                    "SELECT balance FROM users WHERE telegram_id = ?",
+                    (int(order["telegram_id"]),),
+                ).fetchone()
+                if user:
+                    before = int(user["balance"])
+                    amount = int(order["price_toman"])
+                    after = before + amount
+                    conn.execute(
+                        "UPDATE users SET balance = ? WHERE telegram_id = ?",
+                        (after, int(order["telegram_id"])),
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO wallet_transactions (
+                            telegram_id, amount, balance_before, balance_after,
+                            type, description, reference_id, created_at
+                        )
+                        VALUES (?, ?, ?, ?, 'refund', ?, ?, ?)
+                        """,
+                        (
+                            int(order["telegram_id"]), amount, before, after,
+                            f"بازگشت وجه تمدید سرویس #{order_id}",
+                            f"refund:renewal:{order_id}", timestamp,
+                        ),
+                    )
+                    final_status = "refunded"
+
+            conn.execute(
+                """
+                UPDATE renewal_orders
+                SET status = ?, last_error = ?, refunded_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    final_status, error,
+                    timestamp if final_status == "refunded" else None,
+                    timestamp, order_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE subscriptions
+                SET auto_renew_last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (error, timestamp, int(order["subscription_id"])),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def get_renewal_order(order_id: int) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM renewal_orders WHERE id = ?",
+            (int(order_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_pending_renewal_orders(limit: int = 100) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 500))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM renewal_orders
+               WHERE status IN ('pending', 'processing')
+               ORDER BY created_at ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_renewal_history(subscription_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 100))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM renewal_orders
+               WHERE subscription_id = ?
+               ORDER BY id DESC LIMIT ?""",
+            (int(subscription_id), limit),
         ).fetchall()
         return [dict(row) for row in rows]
