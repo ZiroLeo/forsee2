@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 from database import get_connection
-from paxiva import PaxivaClient, PaxivaError
-
+from pasar_guard import PasarGuardError, get_live, is_not_found
+from dev.alerts import send_alert
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,17 @@ VALID_STATES = {
     "disabled",
     "deleted",
 }
+
+# اشتراک فقط وقتی «حذف‌شده در پنل» ثبت می‌شود که در این تعداد چرخهٔ پیاپی
+# پنل صریحاً «کاربر پیدا نشد» (404) برگردانده باشد. (جلوگیری از علامت‌گذاری
+# اشتباه در اثر خطای لحظه‌ای یا پیکربندی اشتباه پنل)
+NOT_FOUND_CONFIRMATIONS = 2
+
+# حداقل فاصلهٔ هشدار دولوپر برای خطای نامطمئن هر پنل (ثانیه)
+ALERT_THROTTLE_SECONDS = 3600
+
+_not_found_strikes: Dict[int, int] = {}
+_last_alert_at: Dict[str, float] = {}
 
 
 # ============================================================
@@ -86,19 +97,27 @@ def _row_to_dict(row: Any) -> dict:
         return {}
 
 
-def _is_not_found_error(error: Exception) -> bool:
-    status_code = getattr(error, "status_code", None)
-    return status_code == 404
+def _is_user_not_found(error: BaseException) -> bool:
+    """
+    فقط وقتی True است که پنل صریحاً بگوید «این کاربر وجود ندارد».
+    404 ناشی از لاگین/آدرس اشتباه پنل («Login failed (404)») حذف‌شده حساب نمی‌شود.
+    """
+    if not isinstance(error, PasarGuardError) or not is_not_found(error):
+        return False
+    return "user not found" in str(error).lower()
 
 
-def _extract_client_data(client_data: Any) -> dict:
-    if isinstance(client_data, dict):
-        return client_data
-    result = {}
-    for field in ("used_bytes", "expires_at", "state"):
-        if hasattr(client_data, field):
-            result[field] = getattr(client_data, field)
-    return result
+def _alert_throttled(key: str, level: str, message: str, **context: Any) -> None:
+    """هشدار دولوپر با throttle تا در قطعی پنل، پیام انبوه ارسال نشود."""
+    now = time.monotonic()
+    last = _last_alert_at.get(key, 0.0)
+    if last and now - last < ALERT_THROTTLE_SECONDS:
+        return
+    _last_alert_at[key] = now
+    try:
+        send_alert(level, message, **context)
+    except Exception:
+        logger.exception("Could not send lifecycle alert.")
 
 
 # ============================================================
@@ -106,32 +125,37 @@ def _extract_client_data(client_data: Any) -> dict:
 # ============================================================
 
 async def sync_single_subscription(
-    paxiva: PaxivaClient,
+    panel_registry: Any,
     subscription: Any,
 ) -> bool:
     """
     اطلاعات یک اشتراک را از پنل دریافت و در دیتابیس به‌روزرسانی می‌کند.
 
+    panel_registry برای سازگاری امضا نگه داشته شده؛ دسترسی به پنل از طریق
+    لایهٔ سازگاری pasar_guard (get_live) و panel_id خود اشتراک انجام می‌شود.
+
     خروجی:
         True  = همگام‌سازی موفق
         False = اشتراک پیدا نشد یا همگام‌سازی ناموفق بود
     """
-
     sub = _row_to_dict(subscription)
-    sub_id = sub.get("id")
-    client_id = sub.get("paxiva_client_id")
 
-    if not sub_id or not client_id:
-        logger.warning("Lifecycle skipped subscription with missing identifiers.")
+    sub_id = sub.get("id")
+    panel_id = sub.get("panel_id")
+    config_name = sub.get("config_name")
+
+    if not sub_id or not panel_id or not config_name:
+        logger.warning(
+            "Lifecycle skipped subscription with missing identifiers. subscription_id=%s",
+            sub_id,
+        )
         return False
 
     try:
-        client_data = await paxiva.get_client(client_id)
-        data = _extract_client_data(client_data)
+        live = await get_live(sub)
 
-        used_bytes = data.get("used_bytes")
-        expires_at_raw = data.get("expires_at")
-        panel_state = data.get("state")
+        used_bytes = live.get("used_bytes")
+        panel_state = live.get("state")
 
         # حجم مصرف‌شده
         if used_bytes is not None:
@@ -148,8 +172,8 @@ async def sync_single_subscription(
                 logger.warning("Unknown panel state for subscription_id=%s", sub_id)
                 panel_state = None
 
-        # انقضا: تبدیل به timestamp عددی
-        expires_at = _to_ts(expires_at_raw)
+        # انقضا: None یعنی بدون انقضا یا نامشخص → تاریخ قبلی دیتابیس را پاک نمی‌کنیم.
+        expires_at = _to_ts(live.get("expires_at"))
 
         updates = []
         values = []
@@ -166,13 +190,15 @@ async def sync_single_subscription(
             updates.append("state = ?")
             values.append(panel_state)
 
+        # پاسخ سالم از پنل گرفته شد → شمارندهٔ «پیدا نشد» صفر می‌شود.
+        _not_found_strikes.pop(int(sub_id), None)
+
         if not updates:
             logger.info("No lifecycle data to update for subscription_id=%s", sub_id)
             return True
 
         updates.append("updated_at = ?")
         values.append(_utc_now())
-
         values.append(sub_id)
 
         with get_connection() as conn:
@@ -181,6 +207,7 @@ async def sync_single_subscription(
                 UPDATE subscriptions
                 SET {", ".join(updates)}
                 WHERE id = ?
+                  AND COALESCE(state, 'active') != 'deleted'
                 """,
                 values,
             )
@@ -189,8 +216,18 @@ async def sync_single_subscription(
         logger.info("Subscription synchronized. subscription_id=%s", sub_id)
         return True
 
-    except PaxivaError as exc:
-        if _is_not_found_error(exc):
+    except PasarGuardError as exc:
+        if _is_user_not_found(exc):
+            strikes = _not_found_strikes.get(int(sub_id), 0) + 1
+            _not_found_strikes[int(sub_id)] = strikes
+
+            if strikes < NOT_FOUND_CONFIRMATIONS:
+                logger.warning(
+                    "Panel user not found (%s/%s), awaiting confirmation. subscription_id=%s",
+                    strikes, NOT_FOUND_CONFIRMATIONS, sub_id,
+                )
+                return False
+
             with get_connection() as conn:
                 conn.execute(
                     """
@@ -202,14 +239,35 @@ async def sync_single_subscription(
                 )
                 conn.commit()
 
+            _not_found_strikes.pop(int(sub_id), None)
             logger.info("Panel client not found. subscription_id=%s", sub_id)
             return False
 
-        logger.exception("Paxiva error while syncing subscription_id=%s", sub_id)
+        # خطای نامطمئن (timeout / 5xx / مشکل لاگین / circuit-open / ...):
+        # هیچ تغییری در دیتابیس نمی‌دهیم.
+        logger.warning(
+            "PasarGuard error while syncing subscription_id=%s panel_id=%s status=%s",
+            sub_id, panel_id, getattr(exc, "status", None),
+        )
+        _alert_throttled(
+            f"sync:{panel_id}",
+            "WARNING",
+            "همگام‌سازی اشتراک‌ها با پنل ناموفق بود (وضعیت دیتابیس تغییری نکرد)",
+            exc=exc,
+            panel_id=panel_id,
+            subscription_id=sub_id,
+        )
         return False
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Unexpected lifecycle sync error. subscription_id=%s", sub_id)
+        _alert_throttled(
+            "sync:unexpected",
+            "ERROR",
+            "خطای غیرمنتظره در همگام‌سازی چرخهٔ عمر اشتراک",
+            exc=exc,
+            subscription_id=sub_id,
+        )
         return False
 
 
@@ -217,7 +275,7 @@ async def sync_single_subscription(
 # همگام‌سازی تمام اشتراک‌ها
 # ============================================================
 
-async def sync_all_active_subscriptions(paxiva: PaxivaClient) -> dict:
+async def sync_all_active_subscriptions(panel_registry: Any = None) -> dict:
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -225,24 +283,56 @@ async def sync_all_active_subscriptions(paxiva: PaxivaClient) -> dict:
             FROM subscriptions
             WHERE deleted_from_list_at IS NULL
               AND COALESCE(state, 'active') != 'deleted'
-              AND paxiva_client_id IS NOT NULL
+              AND panel_id IS NOT NULL
+              AND config_name IS NOT NULL
             ORDER BY id ASC
             """
         ).fetchall()
 
-    stats = {"total": len(rows), "synced": 0, "failed": 0}
+        orphan_row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM subscriptions
+            WHERE deleted_from_list_at IS NULL
+              AND COALESCE(state, 'active') != 'deleted'
+              AND (panel_id IS NULL OR config_name IS NULL)
+            """
+        ).fetchone()
+
+    orphans = 0
+    if orphan_row is not None:
+        try:
+            orphans = int(orphan_row[0])
+        except (TypeError, ValueError, IndexError, KeyError):
+            orphans = 0
+
+    if orphans:
+        logger.warning(
+            "Lifecycle: %s subscription(s) without panel_id/config_name were skipped.",
+            orphans,
+        )
+        _alert_throttled(
+            "sync:orphans",
+            "WARNING",
+            "اشتراک‌هایی بدون panel_id در دیتابیس هستند و همگام‌سازی نمی‌شوند "
+            "(نیاز به backfill)",
+            count=orphans,
+        )
+
+    stats = {"total": len(rows), "synced": 0, "failed": 0, "skipped": orphans}
 
     for row in rows:
-        result = await sync_single_subscription(paxiva, row)
+        result = await sync_single_subscription(panel_registry, row)
         if result:
             stats["synced"] += 1
         else:
             stats["failed"] += 1
+
         await asyncio.sleep(SYNC_INTERVAL_SECONDS)
 
     logger.info(
-        "Lifecycle sync completed. total=%s synced=%s failed=%s",
-        stats["total"], stats["synced"], stats["failed"],
+        "Lifecycle sync completed. total=%s synced=%s failed=%s skipped=%s",
+        stats["total"], stats["synced"], stats["failed"], stats["skipped"],
     )
     return stats
 
@@ -256,10 +346,8 @@ async def remove_old_subscriptions_from_list() -> int:
     اشتراک‌هایی که بیش از ۷ روز از انقضای آن‌ها گذشته،
     از فهرست کاربر حذف می‌شوند.
     """
-
     now = _utc_now()
     cutoff = now - (REMOVE_FROM_LIST_AFTER_DAYS * 86400)
-
     removed_count = 0
 
     with get_connection() as conn:
@@ -305,12 +393,10 @@ async def remove_old_subscriptions_from_list() -> int:
 async def hard_delete_old_subscriptions() -> int:
     """
     رکوردهایی که بیش از ۳۰ روز از حذف آن‌ها از فهرست گذشته،
-    از دیتابیس پاک می‌شوند.
+    از دیتابیس پاک می‌شوند. (فقط رکورد دیتابیس؛ به پنل دست نمی‌زند.)
     """
-
     now = _utc_now()
     cutoff = now - (HARD_DELETE_AFTER_DAYS * 86400)
-
     deleted_count = 0
 
     with get_connection() as conn:
@@ -354,6 +440,7 @@ async def hard_delete_old_subscriptions() -> int:
 async def process_expired_subscriptions() -> dict:
     removed = await remove_old_subscriptions_from_list()
     deleted = await hard_delete_old_subscriptions()
+
     return {
         "removed_from_list": removed,
         "hard_deleted": deleted,
@@ -364,8 +451,8 @@ async def process_expired_subscriptions() -> dict:
 # اجرای یک چرخه کامل
 # ============================================================
 
-async def run_lifecycle_cycle(paxiva: PaxivaClient) -> dict:
-    sync_stats = await sync_all_active_subscriptions(paxiva)
+async def run_lifecycle_cycle(panel_registry: Any = None) -> dict:
+    sync_stats = await sync_all_active_subscriptions(panel_registry)
     cleanup_stats = await process_expired_subscriptions()
 
     result = {"sync": sync_stats, "cleanup": cleanup_stats}
