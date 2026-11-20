@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 from typing import Optional
@@ -13,8 +12,8 @@ from aiogram.exceptions import (
 )
 
 from config import BOT_TOKEN, ADMIN_ID
-from database import init_database, get_setting
-from paxiva import PaxivaClient
+from database import init_database, get_setting, get_panels
+from pasar_guard import panel_registry
 from services.scheduler import start_schedulers
 from logging_setup import setup_logging
 
@@ -69,6 +68,7 @@ from handlers.admin import (
     links,
     test_panel,
     receipts,
+    panels,
 )
 
 # ============================================================
@@ -120,8 +120,6 @@ logger = logging.getLogger(__name__)
 
 _scheduler_task: Optional[asyncio.Task] = None
 _alert_worker_task: Optional[asyncio.Task] = None
-
-paxiva_client: Optional[PaxivaClient] = None
 
 
 # ============================================================
@@ -283,6 +281,49 @@ def _scheduler_task_done(task: asyncio.Task) -> None:
 # STARTUP
 # ============================================================
 
+async def _check_panels() -> None:
+    """
+    بررسی پنل‌های ثبت‌شده در شروع ربات (بدون کرش):
+    * هیچ پنل فعالی نیست → هشدار WARNING (ادمین باید پنل اضافه کند)
+    * اتصال هر پنل فعال تست می‌شود؛ شکست → هشدار ERROR با نام پنل (بدون آدرس/رمز)
+    """
+    try:
+        panels = await asyncio.to_thread(get_panels, True)
+    except Exception as exc:
+        logger.exception("Could not read panels from database.")
+        send_alert("ERROR", "خواندن لیست پنل‌ها از دیتابیس ناموفق بود", exc=exc)
+        return
+
+    if not panels:
+        logger.warning("No active PasarGuard panel is registered.")
+        send_alert(
+            "WARNING",
+            "هیچ پنل فعالی ثبت نشده؛ تا ثبت پنل، خرید و ساخت سرویس کار نمی‌کند.",
+        )
+        return
+
+    async def _probe(panel: dict) -> None:
+        panel_id = panel.get("id")
+        name = str(panel.get("name") or panel_id)
+        try:
+            client = await panel_registry.get_client(int(panel_id))
+            result = await asyncio.wait_for(client.test_connection(), timeout=30)
+        except Exception as exc:
+            logger.exception("Startup panel check crashed. panel=%s", name)
+            send_alert("ERROR", "تست اتصال پنل هنگام استارت با خطا مواجه شد",
+                       exc=exc, panel=name, panel_id=panel_id)
+            return
+        if isinstance(result, dict) and result.get("success"):
+            logger.info("Panel '%s' (#%s) connected.", name, panel_id)
+        else:
+            message = (result or {}).get("message", "unknown") if isinstance(result, dict) else "unknown"
+            logger.error("Panel '%s' (#%s) connection failed: %s", name, panel_id, message)
+            send_alert("ERROR", "اتصال به پنل ناموفق است", panel=name, panel_id=panel_id,
+                       reason=str(message)[:200])
+
+    await asyncio.gather(*(_probe(p) for p in panels), return_exceptions=True)
+
+
 async def on_startup(bot: Bot) -> None:
     """
     عملیات لازم قبل از شروع دریافت پیام‌ها.
@@ -362,14 +403,12 @@ async def on_startup(bot: Bot) -> None:
         raise
 
     # --------------------------------------------------------
-    # 4. PAXIVA CHECK
+    # 4. PASARGUARD PANELS CHECK
     # --------------------------------------------------------
+    # پنل‌ها از داخل دیتابیس خوانده می‌شوند و ادمین از ربات اضافه‌شان می‌کند؛
+    # نبودن پنل نباید مانع روشن‌شدن ربات شود، فقط باید به دولوپر هشدار برود.
 
-    if paxiva_client is None:
-
-        raise RuntimeError(
-            "PaxivaClient was not initialized before startup."
-        )
+    await _check_panels()
 
     # --------------------------------------------------------
     # 5. BACKGROUND SCHEDULER
@@ -383,9 +422,9 @@ async def on_startup(bot: Bot) -> None:
                 start_schedulers(
                     bot,
                     ADMIN_ID,
-                    paxiva_client,
+                    panel_registry,
                 ),
-                name="paxiva-background-scheduler",
+                name="panel-background-scheduler",
             )
 
             _scheduler_task.add_done_callback(
@@ -514,6 +553,7 @@ def register_routers(dp: Dispatcher) -> None:
     dp.include_router(sales.router)
     dp.include_router(prices.router)
     dp.include_router(products.router)
+    dp.include_router(panels.router)
     dp.include_router(discounts.router)
     dp.include_router(services.router)
     dp.include_router(users.router)
@@ -552,7 +592,6 @@ def register_routers(dp: Dispatcher) -> None:
 
 async def close_resources(
     bot: Bot,
-    paxiva: Optional[PaxivaClient],
 ) -> None:
     """
     بستن منابع برنامه حتی در صورت بروز خطا.
@@ -582,24 +621,22 @@ async def close_resources(
         _scheduler_task = None
 
     # --------------------------------------------------------
-    # 2. CLOSE PAXIVA
+    # 2. CLOSE PASARGUARD PANEL CLIENTS
     # --------------------------------------------------------
 
-    if paxiva is not None:
+    try:
 
-        try:
+        await panel_registry.close_all()
 
-            await paxiva.close()
+        logger.info(
+            "PasarGuard panel clients closed."
+        )
 
-            logger.info(
-                "PaxivaClient closed."
-            )
+    except Exception:
 
-        except Exception:
-
-            logger.exception(
-                "Error while closing PaxivaClient."
-            )
+        logger.exception(
+            "Error while closing PasarGuard panel clients."
+        )
 
     # --------------------------------------------------------
     # 3. CLOSE TELEGRAM SESSION
@@ -626,7 +663,6 @@ async def close_resources(
 
 async def main() -> None:
 
-    global paxiva_client
     global _alert_worker_task
 
     bot: Optional[Bot] = None
@@ -782,19 +818,22 @@ async def main() -> None:
         )
 
         # ----------------------------------------------------
-        # 6. INITIALIZE PAXIVA
+        # 6. PASARGUARD PANEL REGISTRY
         # ----------------------------------------------------
-
-        paxiva_client = PaxivaClient()
-
-        dp["paxiva"] = paxiva_client
+        # کلاینت هر پنل هنگام اولین استفاده از دیتابیس ساخته و کش می‌شود.
+        #
+        # ⚠️ موقت: تا وقتی renew/services/stars/test/wheel به panel_registry
+        # منتقل نشده‌اند، پارامتر `paxiva` آن‌ها باید در DI وجود داشته باشد
+        # (وگرنه aiogram با TypeError هندلر را می‌اندازد). بعد از انتقال
+        # آخرین فایل، این خط را حذف کن.
+        dp["paxiva"] = panel_registry
 
         logger.info(
-            "PaxivaClient initialized."
+            "PasarGuard panel registry ready."
         )
 
         print(
-            "[DEBUG 05] Paxiva initialized",
+            "[DEBUG 05] PasarGuard registry ready",
             flush=True,
         )
 
@@ -902,12 +941,7 @@ async def main() -> None:
 
         if bot is not None:
 
-            await close_resources(
-                bot,
-                paxiva_client,
-            )
-
-        paxiva_client = None
+            await close_resources(bot)
 
         logger.info(
             "Application resources closed."
