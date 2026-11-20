@@ -1,4 +1,3 @@
-
 import logging
 
 from aiogram import Router, F
@@ -148,28 +147,58 @@ def admin_main_menu_keyboard() -> InlineKeyboardMarkup:
                 ),
             ],
 
-            # ------------------------------------------------
-            # قیمت و محصولات
-            # ------------------------------------------------
+                # ------------------------------------------------
 
-            [
-                _button(
-                    text="مدیریت قیمت‌ها",
-                    callback_data="admin:prices:menu",
-                    style="primary",
-                    emoji_key="stars",
-                ),
-                _button(
-                    text="مدیریت محصولات",
-                    callback_data="admin:products:menu",
-                    style="success",
-                    emoji_key="shop",
-                ),
-            ],
+                # قیمت و محصولات
+                # ------------------------------------------------
 
-            # ------------------------------------------------
-            # تخفیف و سرویس‌ها
-            # ------------------------------------------------
+                [
+                    _button(
+                        text="مدیریت پنل‌ها",
+                        callback_data="admin:panels:menu",
+                        style="danger",
+                        emoji_key="world",
+                    ),
+                ],
+
+                # ------------------------------------------------
+                # قیمت و محصولات
+                # ------------------------------------------------
+
+                [
+                    _button(
+                        text="مدیریت قیمت‌ها",
+                        callback_data="admin:prices:menu",
+                        style="primary",
+                        emoji_key="stars",
+                    ),
+
+                    _button(
+                        text="مدیریت محصولات",
+                        callback_data="admin:products:menu",
+                        style="success",
+                        emoji_key="shop",
+                    ),
+                ],
+
+                # ------------------------------------------------
+
+                # مدیریت تسک‌ها
+                # ------------------------------------------------
+
+                [
+                    _button(
+                        text="مدیریت تسک‌ها",
+                        callback_data="admin:tasks:menu",
+                        style="primary",
+                        emoji_key="gift",
+                    ),
+                ],
+
+                # ------------------------------------------------
+
+                # تخفیف و سرویس‌ها
+                # ------------------------------------------------
 
             [
                 _button(
@@ -236,7 +265,7 @@ def admin_main_menu_keyboard() -> InlineKeyboardMarkup:
                     emoji_key="diamond",
                 ),
                 _button(
-                    text="تست اتصال PAXIVA",
+                    text="تست اتصال پنل‌ها",
                     callback_data="admin:test_panel:menu",
                     style="primary",
                     emoji_key="light",
